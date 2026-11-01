@@ -1,0 +1,46 @@
+# Low-ELO Lichess Spectator configuration.
+# Paths are relative to the directory you run the CLI from.
+
+[lichess]
+user_agent = "lichess-low-elo-spectate (local, personal use)"
+# Seconds to wait after every request to Lichess (the "courtesy delay").
+courtesy_delay_seconds = 1.0
+# Seconds to pause ALL requests after receiving an HTTP 429.
+rate_limit_pause_seconds = 60
+# Optional personal API token (https://lichess.org/account/oauth/token).
+# Empty means unauthenticated. Not required for anything in this app.
+token = ""
+
+[pool]
+# Team IDs to always scan (the part of the URL after https://lichess.org/team/).
+team_ids = ["chess-beginners", "pca-usa-advanced-beginner"]
+# Keywords searched with /api/team/search; the top `keyword_max_pages` pages
+# (15 teams per page, biggest teams first) of each keyword are scanned.
+# Note: the search also matches team descriptions, so results are noisy; the
+# rating filter below does the real work.
+team_keywords = ["beginner", "improvement", "learning", "novice"]
+keyword_max_pages = 1
+# Lichess streams team members (newest first) at roughly 20 profiles per
+# second, so each team scan is capped at this many members to bound run time.
+# 1500 members is about 75 seconds per large team.
+max_members_per_team = 1500
+# Keep players whose blitz rating is strictly below this.
+rating_cap = 1000
+# Keep players seen on Lichess within this many days.
+active_days = 7
+# How often the pool is rebuilt once the server runs (milestone 3+).
+pool_refresh_hours = 3
+# Already-pooled players that a team scan no longer returns are re-checked via
+# POST /api/users in batches of 300. Lichess allows 8,000 users per 10 minutes,
+# so 20 batches (6,000 users) per refresh stays under the quota.
+max_profile_refresh_batches = 20
+
+[detection]  # used from milestone 2
+max_start_plies = 10
+poll_interval_seconds = 3
+
+[viewer]  # used from milestone 5
+engine_depth = 12
+
+[storage]
+sqlite_path = "spectate.sqlite3"
