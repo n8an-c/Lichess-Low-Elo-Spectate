@@ -35,9 +35,22 @@ pool_refresh_hours = 3
 # so 20 batches (6,000 users) per refresh stays under the quota.
 max_profile_refresh_batches = 20
 
-[detection]  # used from milestone 2
+[detection]
+# Only show games that are at most this many plies (half-moves) in when found.
 max_start_plies = 10
-poll_interval_seconds = 3
+# Sleep after each 100-player status request (on top of the courtesy delay).
+poll_interval_seconds = 2
+# Time control to look for, as Lichess reports it in the status endpoint.
+time_control = "3+0"
+# Skip games created more than this many seconds ago without opening a stream.
+max_game_age_seconds = 120
+# When verifying, the game stream replays all moves so far in a quick burst;
+# a gap of this many seconds with no line means the replay is over.
+replay_idle_seconds = 1.0
+# Give up on a game stream that sends nothing for this long.
+stream_open_timeout_seconds = 15
+# Accepted games are dropped from the candidate list after this long.
+candidate_ttl_seconds = 60
 
 [viewer]  # used from milestone 5
 engine_depth = 12

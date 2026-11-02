@@ -146,6 +146,10 @@ class Database:
         cur = self.conn.execute("SELECT id FROM players WHERE active = 1 ORDER BY id")
         return [row["id"] for row in cur]
 
+    def pool_last_updated(self) -> int | None:
+        """Epoch ms of the newest player row, or None if the pool is empty."""
+        return self.conn.execute("SELECT MAX(updated_at) FROM players").fetchone()[0]
+
     def player_ids(self) -> set[str]:
         return {row["id"] for row in self.conn.execute("SELECT id FROM players")}
 

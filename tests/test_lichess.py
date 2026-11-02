@@ -88,6 +88,29 @@ async def test_stream_ndjson_and_http_error():
         assert exc.value.status_code == 403
 
 
+async def test_open_stream_does_not_block_other_requests():
+    release = asyncio.Event()
+
+    async def body():
+        yield b'{"n": 1}\n'
+        await release.wait()
+        yield b'{"n": 2}\n'
+
+    def handler(request):
+        if request.url.path.startswith("/api/stream/"):
+            return httpx.Response(200, content=body())
+        return httpx.Response(200, json={"ok": True})
+
+    async with make_client(handler) as client:
+        stream = client.stream_game("abc")
+        assert (await anext(stream))["n"] == 1
+        # The stream is open and waiting; a normal request must still go through.
+        assert await asyncio.wait_for(client.get_json("/api/x"), 1) == {"ok": True}
+        release.set()
+        assert (await anext(stream))["n"] == 2
+        await stream.aclose()
+
+
 async def test_users_by_ids_posts_text_plain():
     captured = {}
 

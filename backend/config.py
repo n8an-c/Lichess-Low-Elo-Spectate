@@ -30,7 +30,12 @@ class PoolSettings:
 @dataclass(frozen=True)
 class DetectionSettings:
     max_start_plies: int = 10
-    poll_interval_seconds: float = 3.0
+    poll_interval_seconds: float = 2.0
+    time_control: str = "3+0"
+    max_game_age_seconds: float = 120.0
+    replay_idle_seconds: float = 1.0
+    stream_open_timeout_seconds: float = 15.0
+    candidate_ttl_seconds: float = 60.0
 
 
 @dataclass(frozen=True)

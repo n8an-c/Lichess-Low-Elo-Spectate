@@ -130,25 +130,29 @@ class LichessClient:
     async def stream_ndjson(self, path: str, params: dict[str, Any] | None = None) -> AsyncIterator[dict]:
         """Yield one parsed JSON object per NDJSON line.
 
-        The global lock is held for the lifetime of the stream, so no other
-        request runs while a stream is open.
+        The global lock is held only until the response headers arrive (plus
+        the courtesy delay); the body is then read with the lock released so
+        that a long-lived stream (a game, a large team) does not block the
+        poller. Lichess's "one request at a time" rule applies to opening
+        requests; open game streams have their own separate limit (8 per IP).
         """
         request = self._http.build_request("GET", path, params=params, headers={"Accept": NDJSON})
         async with self._lock:
+            response = await self._send(request, stream=True)
             try:
-                response = await self._send(request, stream=True)
-                try:
-                    if response.status_code >= 400:
-                        await response.aread()
-                        raise LichessHTTPError(response)
-                    async for line in response.aiter_lines():
-                        line = line.strip()
-                        if line:
-                            yield json.loads(line)
-                finally:
+                if response.status_code >= 400:
+                    await response.aread()
                     await response.aclose()
+                    raise LichessHTTPError(response)
             finally:
                 await self._courtesy_delay()
+        try:
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+        finally:
+            await response.aclose()
 
     # -- typed endpoint wrappers -------------------------------------------------
 
