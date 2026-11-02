@@ -3,11 +3,11 @@
 A local web app that finds rated 3+0 blitz games on Lichess where both players
 are rated under 1000 and shows them live. See `SPEC.md` for the design.
 
-Current state: **milestone 2** (pool builder, status poller and game verifier logging qualifying games).
+Current state: **milestone 3** (pool builder, poller, verifier, SSE API and a live chessground board).
 
 ## Setup
 
-Python 3.11+ is required.
+Python 3.11+ and Node 20+ (for the frontend build) are required.
 
 ```bash
 python -m venv .venv
@@ -80,6 +80,44 @@ poll pass 12: 164 players, 9 online, 3 playing, 1 in 3+0 games, 0 queued
 Accepted games are kept in memory for `candidate_ttl_seconds` (newest first)
 for the viewer in milestone 3. Every verified game ID is stored in
 `seen_games` so it is never checked twice.
+
+## Run the web app (milestone 3)
+
+Build the frontend once (and again after changing anything under `frontend/`):
+
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+```
+
+Then start the backend, which also serves the built frontend:
+
+```bash
+python -m backend.cli serve
+```
+
+Open http://127.0.0.1:8000/. The page shows "Waiting for a qualifying game"
+until the poller finds one, then the board follows it live. The "Next game"
+button drops the current game and shows the newest candidate.
+
+During frontend development run `npm run dev` inside `frontend/` as well and
+open http://127.0.0.1:5173/ instead; Vite proxies `/api` to the backend.
+
+API (all local, no auth):
+
+- `GET /api/state`: the current viewer snapshot.
+- `GET /api/events`: server-sent events. First event is `state`; then `game`
+  (a new game is being shown), `move` (`fen`, `lastMove`, `plies`, `wc`, `bc`),
+  `end` (final state with `result`) and `waiting`.
+- `POST /api/next`: drop the current game and pick the next candidate.
+- `POST /api/watch/{gameId}?force=true`: debug aid that follows any live game
+  regardless of the rating rules, e.g. a Lichess TV game, to try the UI.
+- `GET /api/candidates`: the accepted games waiting to be shown.
+
+Lichess delays live game streams by 3 moves, so the board (and the ply
+count) runs slightly behind the real game.
 
 ## Tests
 

@@ -49,12 +49,19 @@ class StorageSettings:
 
 
 @dataclass(frozen=True)
+class ServerSettings:
+    host: str = "127.0.0.1"
+    port: int = 8000
+
+
+@dataclass(frozen=True)
 class Settings:
     lichess: LichessSettings = field(default_factory=LichessSettings)
     pool: PoolSettings = field(default_factory=PoolSettings)
     detection: DetectionSettings = field(default_factory=DetectionSettings)
     viewer: ViewerSettings = field(default_factory=ViewerSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
+    server: ServerSettings = field(default_factory=ServerSettings)
 
 
 def _section(data: dict, name: str, cls):
@@ -79,4 +86,5 @@ def load_settings(path: str | Path = "config.toml") -> Settings:
         detection=_section(data, "detection", DetectionSettings),
         viewer=_section(data, "viewer", ViewerSettings),
         storage=_section(data, "storage", StorageSettings),
+        server=_section(data, "server", ServerSettings),
     )

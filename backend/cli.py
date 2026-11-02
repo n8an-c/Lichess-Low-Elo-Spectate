@@ -48,6 +48,22 @@ async def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from .main import FRONTEND_DIST, create_app
+
+    settings = load_settings(args.config)
+    host = args.host or settings.server.host
+    port = args.port or settings.server.port
+    if not FRONTEND_DIST.is_dir():
+        print("note: frontend/dist not found; run `cd frontend && npm install && npm run build`", file=sys.stderr)
+    app = create_app(settings, skip_pool_build=args.skip_pool_build)
+    print(f"serving on http://{host}:{port}/  (Ctrl+C to stop)", file=sys.stderr)
+    uvicorn.run(app, host=host, port=port, log_config=None)
+    return 0
+
+
 def cmd_show_pool(args: argparse.Namespace) -> int:
     settings = load_settings(args.config)
     with Database(settings.storage.sqlite_path) as db:
@@ -97,6 +113,14 @@ def main(argv: list[str] | None = None) -> int:
         help="do not (re)build the pool on startup even if it is stale; poll whatever is in the database",
     )
     p_watch.set_defaults(func=lambda a: asyncio.run(cmd_watch(a)))
+
+    p_serve = sub.add_parser("serve", parents=[common], help="run the web app (API, SSE and the built frontend)")
+    p_serve.add_argument("--host", default=None, help="bind address (default: [server].host in config)")
+    p_serve.add_argument("--port", type=int, default=None, help="port (default: [server].port in config)")
+    p_serve.add_argument(
+        "--skip-pool-build", action="store_true", help="do not (re)build the pool on startup even if it is stale"
+    )
+    p_serve.set_defaults(func=cmd_serve)
 
     p_show = sub.add_parser("show-pool", parents=[common], help="print pool statistics and a sample of active players")
     p_show.add_argument("--limit", type=int, default=20, help="number of players to list (default 20)")

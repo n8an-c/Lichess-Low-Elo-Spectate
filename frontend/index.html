@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Low-ELO Lichess Spectator</title>
+  </head>
+  <body>
+    <main id="app">
+      <header class="topbar">
+        <h1>Low-ELO Spectator</h1>
+        <button id="next" type="button">Next game</button>
+      </header>
+      <section class="game">
+        <div class="player" id="black">
+          <span class="name">—</span>
+          <span class="rating"></span>
+        </div>
+        <div id="board" class="cg-wrap"></div>
+        <div class="player" id="white">
+          <span class="name">—</span>
+          <span class="rating"></span>
+        </div>
+      </section>
+      <p id="status" class="status">Connecting…</p>
+      <p id="link" class="link"></p>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,62 @@
+@import "chessground/assets/chessground.base.css";
+@import "chessground/assets/chessground.brown.css";
+@import "chessground/assets/chessground.cburnett.css";
+
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  --board-size: min(90vw, 70vh);
+}
+
+body {
+  margin: 0;
+  display: flex;
+  justify-content: center;
+}
+
+#app {
+  width: var(--board-size);
+  padding: 1rem 0 2rem;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.topbar h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.player {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.35rem 0.25rem;
+  font-size: 1rem;
+}
+
+.player .rating {
+  opacity: 0.7;
+}
+
+.cg-wrap {
+  width: var(--board-size);
+  height: var(--board-size);
+}
+
+.status {
+  margin: 0.75rem 0 0.25rem;
+}
+
+.link {
+  margin: 0;
+  font-size: 0.85rem;
+  opacity: 0.75;
+}
+
+body[data-status="waiting"] .cg-wrap {
+  opacity: 0.5;
+}
