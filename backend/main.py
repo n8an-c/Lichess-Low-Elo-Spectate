@@ -30,7 +30,16 @@ def create_app(settings: Settings, *, skip_pool_build: bool = False, client: Lic
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         spectator = Spectator(settings, skip_pool_build=skip_pool_build, client=client)
-        viewer = Viewer(spectator.client, spectator.candidates, settings, broadcaster)
+        pool_cache: dict = {"at": 0.0, "size": 0}
+
+        def stats() -> dict:
+            now = asyncio.get_event_loop().time()
+            if now - pool_cache["at"] > 5:
+                pool_cache["size"] = len(spectator.db.active_player_ids())
+                pool_cache["at"] = now
+            return {"candidates": len(spectator.candidates), "poolSize": pool_cache["size"]}
+
+        viewer = Viewer(spectator.client, spectator.candidates, settings, broadcaster, stats=stats)
         spectator.on_accept.append(viewer.notify_candidate)
         app.state.spectator = spectator
         app.state.viewer = viewer
@@ -54,7 +63,7 @@ def create_app(settings: Settings, *, skip_pool_build: bool = False, client: Lic
 
     @app.get("/api/state")
     async def get_state(request: Request) -> dict:
-        return request.app.state.viewer.state.to_dict()
+        return request.app.state.viewer.snapshot()
 
     @app.get("/api/candidates")
     async def get_candidates(request: Request) -> list[dict]:
@@ -79,7 +88,7 @@ def create_app(settings: Settings, *, skip_pool_build: bool = False, client: Lic
         viewer: Viewer = request.app.state.viewer
 
         async def gen():
-            yield _sse("state", viewer.state.to_dict())
+            yield _sse("state", viewer.snapshot())
             agen = broadcaster.subscribe()
             try:
                 while True:

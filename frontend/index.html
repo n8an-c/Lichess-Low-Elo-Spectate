@@ -9,19 +9,20 @@
     <main id="app">
       <header class="topbar">
         <h1>Low-ELO Spectator</h1>
-        <button id="next" type="button">Next game</button>
+        <button id="next" type="button" title="Shortcut: N">Next game</button>
       </header>
       <section class="game">
         <div class="player" id="black">
-          <span class="name">—</span>
-          <span class="rating"></span>
+          <span class="who"><span class="name">—</span> <span class="rating"></span></span>
+          <span class="clock" id="clock-black">–:––</span>
         </div>
         <div id="board" class="cg-wrap"></div>
         <div class="player" id="white">
-          <span class="name">—</span>
-          <span class="rating"></span>
+          <span class="who"><span class="name">—</span> <span class="rating"></span></span>
+          <span class="clock" id="clock-white">–:––</span>
         </div>
       </section>
+      <p id="result" class="result" hidden></p>
       <p id="status" class="status">Connecting…</p>
       <p id="link" class="link"></p>
     </main>

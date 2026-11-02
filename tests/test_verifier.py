@@ -145,6 +145,29 @@ async def test_verify_handles_404():
     assert v.reason == "HTTP 404"
 
 
+async def test_read_replay_returns_last_line_and_final_description():
+    from backend.verifier import StreamEnded, open_game_stream, read_replay
+
+    lines = move_lines(3)
+    transport = live_transport(header(), lines)
+    async with LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=transport) as client:
+        reader, head = await open_game_stream(client, "abcd1234", SETTINGS.detection)
+        assert head["id"] == "abcd1234"
+        last = await read_replay(reader, SETTINGS.detection)
+        assert last == lines[-1]
+        assert last["lm"] == "a2a3" and last["wc"] == 177 and last["bc"] == 180
+        await reader.close()
+
+    final = header(status={"id": 31, "name": "resign"}, winner="black")
+    transport = live_transport(header(), [*move_lines(2), final], finish=True)
+    async with LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=transport) as client:
+        reader, _ = await open_game_stream(client, "abcd1234", SETTINGS.detection)
+        with pytest.raises(StreamEnded) as exc:
+            await read_replay(reader, SETTINGS.detection)
+        assert exc.value.description["status"]["name"] == "resign"
+        await reader.close()
+
+
 def game(id_, detected_at):
     p = PlayerInfo("x", "X", 800)
     return GameInfo(id=id_, white=p, black=p, created_at=0, plies_at_join=0, detected_at=detected_at)

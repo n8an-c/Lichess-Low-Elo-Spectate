@@ -31,6 +31,7 @@ async def test_state_next_and_events(tmp_path, monkeypatch):
             r = await http.get("/api/state")
             assert r.status_code == 200
             assert r.json()["status"] == "waiting"
+            assert r.json()["waiting"] == {"candidates": 0, "poolSize": 0}
 
             r = await http.post("/api/next")
             assert r.status_code == 200

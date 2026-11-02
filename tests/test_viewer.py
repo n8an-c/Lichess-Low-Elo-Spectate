@@ -128,6 +128,10 @@ async def test_viewer_follows_game_to_the_end(rig):
     assert viewer.state.status == "live"
     assert viewer.state.plies == 4
     assert viewer.state.game.white.name == "Alice"
+    # Clocks and last move are seeded from the replay's last line.
+    joined = collector.events[-1][1]
+    assert (joined["wc"], joined["bc"], joined["lastMove"]) == (176, 180, "a2a3")
+    assert joined["clockAt"] is not None and joined["waiting"] is None
 
     await lichess.send("game0001", {"fen": "8/8/8/8/8/8/8/8 b - - 0 3", "lm": "e2e4", "wc": 170, "bc": 175})
     await lichess.send("game0001", {"fen": "8/8/8/8/8/8/8/8 w - - 0 4", "lm": "e7e5", "wc": 170, "bc": 171})
@@ -135,6 +139,9 @@ async def test_viewer_follows_game_to_the_end(rig):
     assert viewer.state.plies == 6
     assert viewer.state.last_move == "e7e5"
     assert viewer.state.wc == 170 and viewer.state.bc == 171
+    move_event = [d for e, d in collector.events if e == "move"][-1]
+    assert move_event["clockAt"] == viewer.state.clock_at
+    clock_at = viewer.state.clock_at
 
     final = header("game0001", fen="8/8/8/8/8/8/8/8 w - - 0 4", turns=6, status={"id": 30, "name": "mate"}, winner="black")
     await lichess.send("game0001", final)
@@ -142,12 +149,41 @@ async def test_viewer_follows_game_to_the_end(rig):
     await collector.wait_for("end")
     assert viewer.state.status == "finished"
     assert viewer.state.result == {"status": "mate", "winner": "black"}
+    assert viewer.state.last_move == "e7e5"  # final description has no lastMove; keep the highlight
+    assert viewer.state.clock_at == clock_at  # clocks frozen at the last move
     await asyncio.sleep(0.1)
     assert viewer.state.status == "finished"  # stays until next()
 
     snapshot = await viewer.next()
     assert snapshot["status"] == "waiting"
+    assert snapshot["waiting"] == {"candidates": 0, "poolSize": None}
     await collector.wait_for("waiting")
+
+
+async def test_viewer_force_watch_finished_game_shows_result(rig):
+    lichess, viewer, candidates, collector = rig
+    final = header("over00001", fen="8/8/8/8/8/8/8/8 w - - 0 10", turns=18, status={"id": 31, "name": "resign"}, winner="black")
+    lichess.add("over00001", header("over00001"), [*move_lines(18), final])
+    await lichess.end("over00001")
+    await viewer.watch("over00001", force=True)
+    await collector.wait_for("end")
+    assert viewer.state.status == "finished"
+    assert viewer.state.result == {"status": "resign", "winner": "black"}
+    assert viewer.state.plies == 18
+    assert (viewer.state.wc, viewer.state.bc, viewer.state.last_move) == (162, 180, "a2a3")
+    assert [e for e, _ in collector.events][-2:] == ["game", "end"]
+
+
+async def test_viewer_candidate_finished_game_is_skipped(rig):
+    lichess, viewer, candidates, collector = rig
+    final = header("over00002", status={"id": 31, "name": "resign"}, winner="white")
+    lichess.add("over00002", header("over00002"), [*move_lines(2), final])
+    await lichess.end("over00002")
+    candidates.add(candidate("over00002"))
+    viewer.notify_candidate(candidates.newest())
+    await asyncio.sleep(0.3)
+    assert viewer.state.status == "waiting"
+    assert len(candidates) == 0
 
 
 async def test_viewer_skips_candidates_past_the_late_join_limit(rig):

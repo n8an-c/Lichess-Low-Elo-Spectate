@@ -23,16 +23,23 @@ export interface GameResult {
   winner: "white" | "black" | null;
 }
 
+export interface WaitingInfo {
+  candidates: number;
+  poolSize: number | null;
+}
+
 export interface ViewerState {
   status: ViewerStatus;
   game: GameInfo | null;
   fen: string | null;
   lastMove: string | null; // UCI, e.g. "e2e4"
   plies: number;
-  wc: number | null; // white clock, seconds, at the last move
+  wc: number | null; // white clock, seconds, as received with the last move
   bc: number | null;
+  clockAt: number | null; // server epoch ms when wc/bc were received
   result: GameResult | null;
   updatedAt: number;
+  waiting: WaitingInfo | null;
 }
 
 export interface MoveEvent {
@@ -41,4 +48,5 @@ export interface MoveEvent {
   plies: number;
   wc: number | null;
   bc: number | null;
+  clockAt: number | null;
 }

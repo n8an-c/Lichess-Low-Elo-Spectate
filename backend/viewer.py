@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -63,6 +63,9 @@ class Broadcaster:
         return len(self._subscribers)
 
 
+StatsProvider = Callable[[], dict]
+
+
 @dataclass
 class ViewerState:
     status: str = "waiting"  # waiting | live | finished
@@ -72,8 +75,31 @@ class ViewerState:
     plies: int = 0
     wc: int | None = None
     bc: int | None = None
+    clock_at: int | None = None  # epoch ms when wc/bc were received
     result: dict | None = None
     updated_at: float = field(default_factory=time.time)
+    waiting: dict | None = None  # {"candidates": n, "poolSize": m} while waiting
+
+    def apply_position(self, line: dict) -> None:
+        """Update fen / last move / clocks from a stream position line."""
+        self.fen = line["fen"]
+        self.last_move = line.get("lm", self.last_move)
+        self.plies = plies_from_fen(line["fen"])
+        if "wc" in line and "bc" in line:
+            self.wc = line["wc"]
+            self.bc = line["bc"]
+            self.clock_at = int(time.time() * 1000)
+        self.updated_at = time.time()
+
+    def move_payload(self) -> dict:
+        return {
+            "fen": self.fen,
+            "lastMove": self.last_move,
+            "plies": self.plies,
+            "wc": self.wc,
+            "bc": self.bc,
+            "clockAt": self.clock_at,
+        }
 
     def to_dict(self) -> dict:
         game = None
@@ -94,18 +120,29 @@ class ViewerState:
             "plies": self.plies,
             "wc": self.wc,
             "bc": self.bc,
+            "clockAt": self.clock_at,
             "result": self.result,
             "updatedAt": self.updated_at,
+            "waiting": self.waiting,
         }
 
 
 class Viewer:
-    def __init__(self, client: LichessClient, candidates: Candidates, settings: Settings, broadcaster: Broadcaster):
+    def __init__(
+        self,
+        client: LichessClient,
+        candidates: Candidates,
+        settings: Settings,
+        broadcaster: Broadcaster,
+        stats: StatsProvider | None = None,
+    ):
         self.client = client
         self.candidates = candidates
         self.settings = settings
         self.broadcaster = broadcaster
+        self.stats = stats or (lambda: {"candidates": len(candidates), "poolSize": None})
         self.state = ViewerState()
+        self._refresh_waiting()
         self._wake = asyncio.Event()
         self._reader: StreamReader | None = None
         self._follow_task: asyncio.Task | None = None
@@ -134,6 +171,19 @@ class Viewer:
         return self.state.to_dict()
 
     # -- main loop -----------------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        """Current state for /api/state and the SSE `state` event."""
+        if self.state.status == "waiting":
+            self._refresh_waiting()
+        return self.state.to_dict()
+
+    def _refresh_waiting(self) -> None:
+        try:
+            self.state.waiting = self.stats()
+        except Exception:  # stats are decoration only
+            log.exception("stats provider failed")
+            self.state.waiting = None
 
     async def run(self) -> None:
         while True:
@@ -175,11 +225,25 @@ class Viewer:
                 await reader.close()
                 return False
             game = verdict.game or _game_from_header(head)
+            state = ViewerState(status="live", game=game)
             try:
-                fen = await read_replay(reader, det, max_plies=None if force else det.max_start_plies)
-            except StreamEnded:
-                log.info("viewer: skipped %s: already over", game_id)
+                last = await read_replay(reader, det, max_plies=None if force else det.max_start_plies)
+            except StreamEnded as ended:
                 await reader.close()
+                if force and ended.description is not None:
+                    # Debug aid: show a finished game's final position and result.
+                    desc = ended.description
+                    if ended.last_position is not None:
+                        state.apply_position(ended.last_position)  # final clocks and last move
+                    state.fen = desc.get("fen") or state.fen
+                    state.plies = plies_from_fen(state.fen) if state.fen else 0
+                    game.plies_at_join = state.plies
+                    self.state = state
+                    log.info("viewer: showing finished game %s", game.describe())
+                    self.broadcaster.publish("game", self.state.to_dict())
+                    self._finish(_result_from_description(desc), desc.get("fen"))
+                    return True
+                log.info("viewer: skipped %s: already over", game_id)
                 return False
             except ValueError as exc:
                 log.info("viewer: skipped %s: %s", game_id, exc)
@@ -188,9 +252,11 @@ class Viewer:
         except Exception:
             await reader.close()
             raise
-        game.plies_at_join = plies_from_fen(fen) if fen else 0
-        game.fen = fen
-        self.state = ViewerState(status="live", game=game, fen=fen, plies=game.plies_at_join)
+        if last is not None:
+            state.apply_position(last)
+        game.plies_at_join = state.plies
+        game.fen = state.fen
+        self.state = state
         self._reader = reader
         self._follow_task = asyncio.create_task(self._follow(reader, game.id), name=f"follow-{game.id}")
         log.info("viewer: now showing %s", game.describe())
@@ -207,20 +273,11 @@ class Viewer:
                     status = (line.get("status") or {}).get("name")
                     if status in LIVE_STATUSES:
                         continue
-                    self._finish({"status": status or "unknownFinish", "winner": line.get("winner")}, line.get("fen"))
+                    self._finish(_result_from_description(line), line.get("fen"))
                     return
                 if "fen" in line:
-                    self.state.fen = line["fen"]
-                    self.state.last_move = line.get("lm")
-                    self.state.plies = plies_from_fen(line["fen"])
-                    self.state.wc = line.get("wc")
-                    self.state.bc = line.get("bc")
-                    self.state.updated_at = time.time()
-                    self.broadcaster.publish(
-                        "move",
-                        {"fen": self.state.fen, "lastMove": self.state.last_move, "plies": self.state.plies,
-                         "wc": self.state.wc, "bc": self.state.bc},
-                    )
+                    self.state.apply_position(line)
+                    self.broadcaster.publish("move", self.state.move_payload())
         except StreamEnded:
             self._finish({"status": "unknownFinish", "winner": None}, None)
         except asyncio.CancelledError:
@@ -256,10 +313,16 @@ class Viewer:
 
     def _set_waiting(self) -> None:
         self.state = ViewerState(status="waiting")
+        self._refresh_waiting()
         self.broadcaster.publish("waiting", self.state.to_dict())
 
     async def stop(self) -> None:
         await self._stop_following()
+
+
+def _result_from_description(desc: dict) -> dict:
+    status = (desc.get("status") or {}).get("name") or "unknownFinish"
+    return {"status": status, "winner": desc.get("winner")}
 
 
 def _game_from_header(head: dict) -> GameInfo:

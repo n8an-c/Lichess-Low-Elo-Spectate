@@ -3,7 +3,7 @@
 A local web app that finds rated 3+0 blitz games on Lichess where both players
 are rated under 1000 and shows them live. See `SPEC.md` for the design.
 
-Current state: **milestone 3** (pool builder, poller, verifier, SSE API and a live chessground board).
+Current state: **milestone 4** (pool builder, poller, verifier, SSE API, live board with clocks, Next game and end-of-game handling).
 
 ## Setup
 
@@ -99,8 +99,17 @@ python -m backend.cli serve
 ```
 
 Open http://127.0.0.1:8000/. The page shows "Waiting for a qualifying game"
-until the poller finds one, then the board follows it live. The "Next game"
-button drops the current game and shows the newest candidate.
+(with the pool size and candidate count) until the poller finds one, then
+the board follows it live with both clocks running. When the game ends the
+final position stays on screen with the result ("Checkmate · Black wins",
+"White resigned · Black wins", "Draw", …) until you click **Next game** (or
+press `N`). During a live game the same button reads **Skip game**.
+
+Clocks: Lichess sends the remaining time with every move and delays live
+streams by 3 moves, so the browser runs the side-to-move clock down locally
+and snaps it to the real value on each move. Expect small corrections at
+every move; that is the delayed feed, not a bug. Like Lichess, the clocks
+only start after each side's first move.
 
 During frontend development run `npm run dev` inside `frontend/` as well and
 open http://127.0.0.1:5173/ instead; Vite proxies `/api` to the backend.
@@ -109,11 +118,12 @@ API (all local, no auth):
 
 - `GET /api/state`: the current viewer snapshot.
 - `GET /api/events`: server-sent events. First event is `state`; then `game`
-  (a new game is being shown), `move` (`fen`, `lastMove`, `plies`, `wc`, `bc`),
-  `end` (final state with `result`) and `waiting`.
+  (a new game is being shown), `move` (`fen`, `lastMove`, `plies`, `wc`, `bc`,
+  `clockAt`), `end` (final state with `result`) and `waiting`.
 - `POST /api/next`: drop the current game and pick the next candidate.
-- `POST /api/watch/{gameId}?force=true`: debug aid that follows any live game
-  regardless of the rating rules, e.g. a Lichess TV game, to try the UI.
+- `POST /api/watch/{gameId}?force=true`: debug aid that follows any game
+  regardless of the rating rules, e.g. a Lichess TV game, to try the UI. A
+  finished game shows its final position and result straight away.
 - `GET /api/candidates`: the accepted games waiting to be shown.
 
 Lichess delays live game streams by 3 moves, so the board (and the ply

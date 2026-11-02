@@ -110,7 +110,16 @@ def check_header(head: dict, settings: Settings, now_ms: int, *, check_age: bool
 
 
 class StreamEnded(Exception):
-    """The game stream closed (normally after the final game description)."""
+    """The game stream closed (normally after the final game description).
+
+    ``description`` holds that final game description line when one was seen,
+    and ``last_position`` the last ``{fen, lm?, wc, bc}`` line before it.
+    """
+
+    def __init__(self, description: dict | None = None, last_position: dict | None = None):
+        super().__init__("stream ended")
+        self.description = description
+        self.last_position = last_position
 
 
 class StreamReader:
@@ -173,23 +182,25 @@ def is_game_description(line: dict) -> bool:
     return "id" in line and "players" in line
 
 
-async def read_replay(reader: StreamReader, det, *, max_plies: int | None = None) -> str | None:
-    """Consume the replay burst and return the last FEN seen.
+async def read_replay(reader: StreamReader, det, *, max_plies: int | None = None) -> dict | None:
+    """Consume the replay burst and return the last position line seen.
 
-    Returns None if the burst ended with no position. Raises StreamEnded when
-    the stream closes or a final game description arrives (game over), and
+    The line looks like ``{"fen", "lm"?, "wc", "bc"}``. Returns None if the
+    burst ended with no position. Raises StreamEnded (carrying the final
+    game description, if any) when the game is already over, and
     ``ValueError`` with a reason for the clock / ply early-exit checks.
     """
-    last_fen: str | None = None
+    last: dict | None = None
     first_clock_checked = False
     while True:
         line = await reader.next(det.replay_idle_seconds)
         if line is None:
-            return last_fen  # replay burst finished; the game is live from here
-        if "fen" not in line or is_game_description(line):
-            if is_game_description(line):
-                raise StreamEnded()
+            return last  # replay burst finished; the game is live from here
+        if is_game_description(line):
+            raise StreamEnded(line, last)
+        if "fen" not in line:
             continue
+        last = line
         last_fen = line["fen"]
         if not first_clock_checked and "wc" in line and "bc" in line:
             first_clock_checked = True
@@ -243,17 +254,17 @@ async def verify_game(
         game = verdict.game
         assert game is not None
         try:
-            last_fen = await read_replay(reader, det, max_plies=det.max_start_plies)
+            last = await read_replay(reader, det, max_plies=det.max_start_plies)
         except StreamEnded:
             return Verdict(False, "stream ended (game over)")
         except ValueError as exc:
             return Verdict(False, str(exc))
         except LichessError as exc:
             return Verdict(False, str(exc))
-        if last_fen is None:
+        if last is None:
             return Verdict(False, "no position received")
-        game.plies_at_join = plies_from_fen(last_fen)
-        game.fen = last_fen
+        game.plies_at_join = plies_from_fen(last["fen"])
+        game.fen = last["fen"]
         return Verdict(True, "ok", game)
     finally:
         await reader.close()
