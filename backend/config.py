@@ -29,6 +29,7 @@ class PoolSettings:
 
 @dataclass(frozen=True)
 class DetectionSettings:
+    mode: str = "both"  # "poll" (status polling), "stream" (games-by-users streams) or "both"
     max_start_plies: int = 10
     poll_interval_seconds: float = 2.0
     time_control: str = "3+0"
@@ -36,6 +37,20 @@ class DetectionSettings:
     replay_idle_seconds: float = 1.0
     stream_open_timeout_seconds: float = 15.0
     candidate_ttl_seconds: float = 60.0
+    stream_backoff_seconds: float = 5.0
+    stream_backoff_max_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("poll", "stream", "both"):
+            raise ValueError(f'[detection] mode must be "poll", "stream" or "both", not {self.mode!r}')
+
+    @property
+    def poll_enabled(self) -> bool:
+        return self.mode in ("poll", "both")
+
+    @property
+    def stream_enabled(self) -> bool:
+        return self.mode in ("stream", "both")
 
 
 @dataclass(frozen=True)

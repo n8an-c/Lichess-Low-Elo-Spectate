@@ -34,7 +34,19 @@ CREATE TABLE IF NOT EXISTS seen_games (
     first_seen INTEGER NOT NULL,
     accepted   INTEGER NOT NULL DEFAULT 0
 );
+
+-- Opponents seen in game headers who are not in the pool yet; the pool
+-- refresh fetches their profiles and adds the ones that qualify.
+CREATE TABLE IF NOT EXISTS discovered_players (
+    id          TEXT PRIMARY KEY,
+    first_seen  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    last_rating INTEGER,
+    fetched_at  INTEGER
+);
 """
+
+DAY_MS = 86_400_000
 
 
 @dataclass(frozen=True)
@@ -185,6 +197,63 @@ class Database:
             "teams_total": teams["n"] or 0,
             "teams_scanned": teams["scanned"] or 0,
         }
+
+    def players_by_source(self) -> dict[str, int]:
+        """Active player counts per source_team (teams and 'opponent')."""
+        cur = self.conn.execute(
+            "SELECT COALESCE(source_team, '?') AS src, COUNT(*) AS n FROM players WHERE active = 1 "
+            "GROUP BY src ORDER BY n DESC"
+        )
+        return {row["src"]: row["n"] for row in cur}
+
+    # -- discovered opponents -----------------------------------------------------------
+
+    def in_pool(self, player_id: str, active_days: int = 7) -> bool:
+        """True if the player is active, or was evaluated (and dropped) recently."""
+        row = self.conn.execute("SELECT active, updated_at FROM players WHERE id = ?", (player_id,)).fetchone()
+        if row is None:
+            return False
+        if row["active"]:
+            return True
+        return row["updated_at"] >= now_ms() - active_days * DAY_MS
+
+    def record_discovered(self, player_id: str, rating: int, active_days: int = 7) -> None:
+        """Remember an opponent to look up at the next pool refresh.
+
+        A player fetched more than ``active_days`` ago becomes fetchable again.
+        """
+        ts = now_ms()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO discovered_players (id, first_seen, last_seen, last_rating, fetched_at)
+                VALUES (?, ?, ?, ?, NULL)
+                ON CONFLICT(id) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    last_rating = excluded.last_rating,
+                    fetched_at = CASE
+                        WHEN discovered_players.fetched_at IS NOT NULL AND discovered_players.fetched_at < ?
+                        THEN NULL ELSE discovered_players.fetched_at END
+                """,
+                (player_id, ts, ts, rating, ts - active_days * DAY_MS),
+            )
+
+    def discovered_to_fetch(self, limit: int | None = None) -> list[str]:
+        sql = "SELECT id FROM discovered_players WHERE fetched_at IS NULL ORDER BY last_seen DESC"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return [row["id"] for row in self.conn.execute(sql)]
+
+    def mark_discovered_fetched(self, ids: Iterable[str]) -> None:
+        ts = now_ms()
+        with self.conn:
+            self.conn.executemany("UPDATE discovered_players SET fetched_at = ? WHERE id = ?", [(ts, i) for i in ids])
+
+    def discovered_stats(self) -> dict:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS total, SUM(fetched_at IS NULL) AS pending FROM discovered_players"
+        ).fetchone()
+        return {"total": row["total"] or 0, "pending": row["pending"] or 0}
 
     # -- seen games (milestone 2) ----------------------------------------------------
 

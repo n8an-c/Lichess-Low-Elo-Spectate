@@ -1,4 +1,4 @@
-"""Orchestrates the pool refresher, poller and verifier in one process."""
+"""Orchestrates the pool refresher, the detectors and the verifier in one process."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from collections.abc import Callable
 
 from .config import Settings
 from .db import Database
+from .gamestream import GameStreamWatcher
 from .lichess import LichessClient
 from .poller import Poller
 from .pool import build_pool
@@ -26,14 +27,34 @@ class Spectator:
         self.client = client or LichessClient(settings.lichess)
         self.db = Database(settings.storage.sqlite_path)
         self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.pending: set[str] = set()  # game IDs queued or being verified (shared by the detectors)
+        self.pool_refreshed = asyncio.Event()
         self.candidates = Candidates(settings.detection.candidate_ttl_seconds)
-        self.poller = Poller(self.client, self.db, settings.detection, self.queue)
+        det = settings.detection
+        self.poller = Poller(self.client, self.db, det, self.queue, self.pending) if det.poll_enabled else None
+        self.watcher = (
+            GameStreamWatcher(self.client, self.db, settings, self.queue, self.pending, self.pool_refreshed, self.discover)
+            if det.stream_enabled
+            else None
+        )
         self.on_accept: list[AcceptCallback] = []
         self.accepted_total = 0
         self.rejected_total = 0
+        self.discovered_total = 0
         self.crashes = 0
         self.restart_delay = 5.0
         self._tasks: list[asyncio.Task] = []
+
+    # -- opponent discovery --------------------------------------------------------
+
+    def discover(self, player_id: str, rating: int) -> None:
+        """Record an opponent seen in a game header as a pool candidate."""
+        pool = self.settings.pool
+        if rating >= pool.rating_cap or self.db.in_pool(player_id, pool.active_days):
+            return
+        self.db.record_discovered(player_id, rating, pool.active_days)
+        self.discovered_total += 1
+        log.debug("discovered opponent %s (%d)", player_id, rating)
 
     # -- background loops --------------------------------------------------------
 
@@ -53,10 +74,11 @@ class Spectator:
                 log.info("player pool is fresh (%d active players); next refresh in %.1fh",
                          len(self.db.active_player_ids()), self.settings.pool.pool_refresh_hours)
             else:
-                log.info("player pool is empty or stale; building it now (polling continues meanwhile)")
+                log.info("player pool is empty or stale; building it now (detection continues meanwhile)")
                 try:
                     result = await build_pool(self.client, self.db, self.settings.pool)
                     log.info("pool refresh done: %d active players", result.qualifying)
+                    self.pool_refreshed.set()  # the games-by-users watcher rebuilds its streams
                 except Exception:  # keep the service alive; try again next cycle
                     log.exception("pool build failed")
             await asyncio.sleep(refresh_seconds)
@@ -66,7 +88,7 @@ class Spectator:
         while True:
             game_id = await self.queue.get()
             try:
-                verdict = await verify_game(self.client, game_id, self.settings)
+                verdict = await verify_game(self.client, game_id, self.settings, discover=self.discover)
                 self.db.record_game(game_id, verdict.accepted)
                 if verdict.accepted and verdict.game is not None:
                     self.accepted_total += 1
@@ -83,7 +105,7 @@ class Spectator:
             except Exception:
                 log.exception("verification of %s crashed", game_id)
             finally:
-                self.poller.release(game_id)
+                self.pending.discard(game_id)
                 self.queue.task_done()
 
     async def expiry_loop(self) -> None:
@@ -93,6 +115,17 @@ class Spectator:
                 log.debug("candidate %s expired (older than %.0fs)", game.id, self.candidates.ttl)
 
     # -- lifecycle -----------------------------------------------------------------
+
+    def loops(self) -> dict[str, Callable]:
+        """The background loops enabled by the configuration."""
+        loops: dict[str, Callable] = {"pool": self.pool_loop}
+        if self.poller is not None:
+            loops["poller"] = self.poller.run
+        if self.watcher is not None:
+            loops["gamestream"] = self.watcher.run
+        loops["verifier"] = self.verifier_loop
+        loops["expiry"] = self.expiry_loop
+        return loops
 
     async def _supervise(self, name: str, factory, restart_delay: float = 5.0) -> None:
         """Run a loop forever; log and restart it if it crashes. Only cancellation stops it."""
@@ -109,15 +142,10 @@ class Spectator:
 
     async def run(self) -> None:
         """Run all loops until cancelled. A crashing loop is restarted, never fatal."""
-        loops = {
-            "pool": self.pool_loop,
-            "poller": self.poller.run,
-            "verifier": self.verifier_loop,
-            "expiry": self.expiry_loop,
-        }
+        log.info("detection mode: %s", self.settings.detection.mode)
         self._tasks = [
             asyncio.create_task(self._supervise(name, factory, self.restart_delay), name=name)
-            for name, factory in loops.items()
+            for name, factory in self.loops().items()
         ]
         try:
             await asyncio.gather(*self._tasks)

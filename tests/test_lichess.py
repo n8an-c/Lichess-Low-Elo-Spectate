@@ -163,6 +163,27 @@ async def test_users_by_ids_posts_text_plain():
     assert captured == {"method": "POST", "content_type": "text/plain", "body": "a,b"}
 
 
+async def test_stream_games_by_users_posts_ids():
+    captured = {}
+
+    def handler(request):
+        captured.update(method=request.method, body=request.content.decode(), params=dict(request.url.params),
+                        content_type=request.headers["content-type"], accept=request.headers["accept"],
+                        read_timeout=request.extensions["timeout"]["read"])
+        return httpx.Response(200, text='{"id": "g1"}\n')
+
+    async with make_client(handler) as client:
+        docs = [d async for d in client.stream_games_by_users(["a", "b"])]
+        assert docs == [{"id": "g1"}]
+        assert captured == {"method": "POST", "body": "a,b", "params": {"withCurrentGames": "true"},
+                            "content_type": "text/plain", "accept": "application/x-ndjson",
+                            "read_timeout": 900.0}  # idle streams must not hit the 30s request timeout
+        with pytest.raises(ValueError):
+            client.stream_games_by_users(["x"] * 301)
+        with pytest.raises(ValueError):
+            client.stream_games_by_users([])
+
+
 async def test_users_status_params():
     captured = {}
 

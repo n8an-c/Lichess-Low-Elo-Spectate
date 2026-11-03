@@ -36,6 +36,16 @@ pool_refresh_hours = 3
 max_profile_refresh_batches = 20
 
 [detection]
+# How games are found:
+#   "poll"   = ask /api/users/status about pooled players every few seconds
+#   "stream" = keep /api/stream/games-by-users streams open (one per 300 pooled
+#              players); Lichess only reports games where BOTH players are in
+#              the pool, so this mainly pays off as the pool grows
+#   "both"   = run both (recommended); duplicates are removed
+mode = "both"
+# Reconnect delay after a games-by-users stream drops; doubles up to the max.
+stream_backoff_seconds = 5
+stream_backoff_max_seconds = 60
 # Only show games that are at most this many plies (half-moves) in when found.
 max_start_plies = 10
 # Sleep after each 100-player status request (on top of the courtesy delay).

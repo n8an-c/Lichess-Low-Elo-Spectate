@@ -139,6 +139,33 @@ async def test_verify_rejects_header_without_reading_moves():
     assert v.reason == "not rated"
 
 
+async def test_verify_reports_both_players_to_discover_even_when_rejected():
+    seen = []
+    strong = {
+        "white": {"user": {"name": "Alice", "id": "alice"}, "rating": 2400},
+        "black": {"user": {"name": "Bob", "id": "bob"}, "rating": 950},
+    }
+    transport = live_transport(header(players=strong), move_lines(2))
+    async with LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=transport) as client:
+        v = await verify_game(client, "abcd1234", SETTINGS, now_ms=NOW, discover=lambda uid, r: seen.append((uid, r)))
+    assert v.reason == "Alice rated 2400 >= 1000"
+    assert seen == [("alice", 2400), ("bob", 950)]
+
+    seen.clear()
+    transport = live_transport(header(rated=False), move_lines(2))
+    async with LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=transport) as client:
+        await verify_game(client, "abcd1234", SETTINGS, now_ms=NOW, discover=lambda uid, r: seen.append((uid, r)))
+    assert seen == []  # casual game: ratings are not blitz ratings worth recording
+
+
+async def test_verify_age_rule_ignores_games_still_at_ply_zero():
+    old = header(createdAt=NOW - 500_000)
+    v = await run_verify(live_transport(old, move_lines(0)))
+    assert v.accepted and v.game.plies_at_join == 0
+    v = await run_verify(live_transport(old, move_lines(2)))
+    assert not v.accepted and v.reason == "started 500s ago"
+
+
 async def test_verify_handles_404():
     v = await run_verify(live_transport(header(), []), game_id="missing1")
     assert not v.accepted

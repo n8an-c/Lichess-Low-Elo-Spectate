@@ -68,10 +68,43 @@ python -m backend.cli watch
   both ratings under the cap / not finished / started recently, reads the
   replayed moves and accepts the game if it is at most `max_start_plies` in.
 
+### How games are found
+
+Two detectors feed the same verifier; `[detection] mode` in `config.toml`
+picks `"poll"`, `"stream"` or `"both"` (the default):
+
+- **Polling** asks `/api/users/status?withGameMetas=true` about 100 pooled
+  players at a time, every few seconds. It sees every game a pooled player
+  starts, whoever the opponent is.
+- **Streaming** keeps one `POST /api/stream/games-by-users` connection open
+  per 300 pooled players (`withCurrentGames=true`, so games already running
+  are reported on connect). It costs no polling requests at all, but Lichess
+  only reports a game when **both players are in the same list**, so with a
+  small pool it finds little. It becomes useful as opponent discovery (below)
+  grows the pool into a cluster of players who meet each other. Streams are
+  rebuilt after every pool refresh and reconnect with backoff
+  (`stream_backoff_seconds`, doubling up to `stream_backoff_max_seconds`).
+
+Both detectors share one "pending" set and the `seen_games` table, so a game
+is verified once no matter who found it.
+
+**Growing the pool from opponents.** Every game header the verifier or the
+stream sees names both players with their blitz ratings. Players who are not
+in the pool and are rated under the cap in that game are recorded in
+`discovered_players`. The next pool refresh looks them up with
+`POST /api/users` (300 per call, inside the same `max_profile_refresh_batches`
+budget as the regular refresh, so the 8,000-per-10-minutes quota holds),
+applies the usual filter (non-provisional blitz rating under the cap, seen in
+the last 7 days, not a bot) and adds the qualifying ones with source
+`opponent`. `show-pool` prints how many are recorded and waiting.
+
 Log lines to look for:
 
 ```
 found 3+0 game AbCdEfGh (https://lichess.org/AbCdEfGh); verifying
+stream: found 3+0 game AbCdEfGh (https://lichess.org/AbCdEfGh); verifying
+stream: game AbCdEfGh skipped (not rated)
+games-by-users: 3 stream(s) covering 878 pooled players
 ACCEPTED AbCdEfGh: alice (812) vs bob (947), 4 plies  https://lichess.org/AbCdEfGh
 rejected AbCdEfGh: 14 plies already played
 poll pass 12: 164 players, 9 online, 3 playing, 1 in 3+0 games, 0 queued

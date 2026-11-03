@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .config import Settings
@@ -77,6 +78,20 @@ def _player(side: dict) -> PlayerInfo | None:
     return PlayerInfo(id=user["id"], name=user.get("name", user["id"]), rating=int(side["rating"]), title=user.get("title"))
 
 
+def header_players(head: dict) -> tuple[PlayerInfo | None, PlayerInfo | None]:
+    """Both players of a game stream header (None for anonymous / AI sides)."""
+    players = head.get("players") or {}
+    return _player(players.get("white") or {}), _player(players.get("black") or {})
+
+
+def is_rated_standard_blitz(head: dict) -> bool:
+    """True when the header's ratings are blitz ratings worth learning from."""
+    return bool(head.get("rated")) and (head.get("variant") or {}).get("key") == "standard" and head.get("speed") == "blitz"
+
+
+DiscoverCallback = Callable[[str, int], None]  # (player id, rating in this game)
+
+
 def check_header(head: dict, settings: Settings, now_ms: int, *, check_age: bool = True) -> Verdict:
     """Apply every check that can be made from the stream's first line.
 
@@ -92,7 +107,7 @@ def check_header(head: dict, settings: Settings, now_ms: int, *, check_age: bool
     if head.get("speed") != "blitz":
         return Verdict(False, f"speed {head.get('speed')}")
     players = head.get("players") or {}
-    white, black = _player(players.get("white") or {}), _player(players.get("black") or {})
+    white, black = header_players(head)
     if white is None or black is None:
         return Verdict(False, "anonymous or computer player")
     cap = settings.pool.rating_cap
@@ -232,9 +247,18 @@ async def open_game_stream(client: LichessClient, game_id: str, det) -> tuple[St
 
 
 async def verify_game(
-    client: LichessClient, game_id: str, settings: Settings, now_ms: int | None = None
+    client: LichessClient,
+    game_id: str,
+    settings: Settings,
+    now_ms: int | None = None,
+    discover: DiscoverCallback | None = None,
 ) -> Verdict:
-    """Open the game stream, check the header, then count the replayed plies."""
+    """Open the game stream, check the header, then count the replayed plies.
+
+    ``discover`` is called with (player id, rating) for both players of every
+    rated standard blitz header, accepted or not, so opponents can be
+    recorded as pool candidates.
+    """
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     det = settings.detection
     try:
@@ -248,7 +272,17 @@ async def verify_game(
     except LichessError as exc:
         return Verdict(False, str(exc))
     try:
-        verdict = check_header(head, settings, now)
+        if discover is not None and is_rated_standard_blitz(head):
+            for p in header_players(head):
+                if p is not None:
+                    try:
+                        discover(p.id, p.rating)
+                    except Exception:
+                        log.exception("discover callback failed for %s", p.id)
+        # The age rule is applied after the replay: a game still at ply 0 is
+        # never "too old" (games arrive from the stream the moment they are
+        # created, sometimes before anyone has moved).
+        verdict = check_header(head, settings, now, check_age=False)
         if not verdict.accepted:
             return verdict
         game = verdict.game
@@ -263,7 +297,11 @@ async def verify_game(
             return Verdict(False, str(exc))
         if last is None:
             return Verdict(False, "no position received")
-        game.plies_at_join = plies_from_fen(last["fen"])
+        plies = plies_from_fen(last["fen"])
+        age = (now - game.created_at) / 1000 if game.created_at else None
+        if plies > 0 and age is not None and age > det.max_game_age_seconds:
+            return Verdict(False, f"started {age:.0f}s ago")
+        game.plies_at_join = plies
         game.fen = last["fen"]
         return Verdict(True, "ok", game)
     finally:

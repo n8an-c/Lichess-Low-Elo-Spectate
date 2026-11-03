@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://lichess.org"
 NDJSON = "application/x-ndjson"
+STREAM_READ_TIMEOUT = 900.0  # seconds without a byte before an NDJSON stream is considered dead
 
 
 class LichessError(Exception):
@@ -134,7 +135,15 @@ class LichessClient:
     async def post_text_json(self, path: str, body: str, params: dict[str, Any] | None = None) -> Any:
         return await self.request_json("POST", path, params=params, content=body, content_type="text/plain")
 
-    async def stream_ndjson(self, path: str, params: dict[str, Any] | None = None) -> AsyncIterator[dict]:
+    async def stream_ndjson(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        method: str = "GET",
+        content: str | None = None,
+        content_type: str | None = None,
+    ) -> AsyncIterator[dict]:
         """Yield one parsed JSON object per NDJSON line.
 
         The global lock is held only until the response headers arrive (plus
@@ -143,7 +152,17 @@ class LichessClient:
         poller. Lichess's "one request at a time" rule applies to opening
         requests; open game streams have their own separate limit (8 per IP).
         """
-        request = self._http.build_request("GET", path, params=params, headers={"Accept": NDJSON})
+        headers = {"Accept": NDJSON}
+        if content_type:
+            headers["Content-Type"] = content_type
+        # Streams can legitimately stay silent for a long time (games-by-users
+        # only speaks when a game starts or ends), so only the connect phase
+        # keeps the normal timeout; reads get a generous one and the callers
+        # reconnect if a stream really goes quiet for that long.
+        request = self._http.build_request(
+            method, path, params=params, content=content, headers=headers,
+            timeout=httpx.Timeout(30.0, read=STREAM_READ_TIMEOUT),
+        )
         async with self._lock:
             response = await self._send(request, stream=True)
             try:
@@ -205,6 +224,23 @@ class LichessClient:
         params: dict[str, Any] = {"ids": ",".join(ids)}
         params["withGameMetas" if with_game_metas else "withGameIds"] = "true"
         return await self.get_json("/api/users/status", params)
+
+    def stream_games_by_users(self, ids: list[str], with_current_games: bool = True) -> AsyncIterator[dict]:
+        """POST /api/stream/games-by-users: games between the listed users, as they start and finish.
+
+        At most 300 IDs. Lichess only emits games where *both* players are in
+        the list. With ``with_current_games`` the games already in progress are
+        sent first. Each line is a game document with ``clock``, ``rated``,
+        ``variant``, ``statusName`` and ``players.{white,black}.{userId,rating}``.
+        """
+        if len(ids) > 300:
+            raise ValueError("stream_games_by_users accepts at most 300 IDs per stream")
+        if not ids:
+            raise ValueError("stream_games_by_users needs at least one ID")
+        params = {"withCurrentGames": "true"} if with_current_games else None
+        return self.stream_ndjson(
+            "/api/stream/games-by-users", params, method="POST", content=",".join(ids), content_type="text/plain"
+        )
 
     def stream_game(self, game_id: str) -> AsyncIterator[dict]:
         """GET /api/stream/game/{id} (used from milestone 2).

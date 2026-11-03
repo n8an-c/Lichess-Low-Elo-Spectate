@@ -23,12 +23,21 @@ STATUS_BATCH = 100
 
 
 class Poller:
-    def __init__(self, client: LichessClient, db: Database, settings: DetectionSettings, queue: asyncio.Queue):
+    def __init__(
+        self,
+        client: LichessClient,
+        db: Database,
+        settings: DetectionSettings,
+        queue: asyncio.Queue,
+        pending: set[str] | None = None,
+    ):
         self.client = client
         self.db = db
         self.settings = settings
         self.queue = queue
-        self._pending: set[str] = set()  # game IDs queued or being verified
+        # Game IDs queued or being verified; shared with the games-by-users
+        # watcher so the same game is never queued twice.
+        self._pending: set[str] = pending if pending is not None else set()
         self.passes = 0
         self.last_pass_online = 0
         self.last_pass_playing = 0

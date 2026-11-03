@@ -36,6 +36,9 @@ class PoolBuildResult:
     deactivated: int = 0
     refreshed: int = 0
     refresh_truncated: int = 0
+    discovered_fetched: int = 0
+    discovered_added: int = 0
+    discovered_pending: int = 0
     rate_limit_hits: int = 0
     requests: int = 0
     seconds: float = 0.0
@@ -46,6 +49,8 @@ class PoolBuildResult:
             f"teams: {self.teams_found} found, {self.teams_scanned} scanned, {self.teams_skipped} skipped",
             f"users evaluated: {self.users_seen} (team scans) + {self.refreshed} (profile refresh)",
             f"qualifying players: {self.qualifying} ({self.added} new), deactivated: {self.deactivated}",
+            f"opponents: {self.discovered_fetched} fetched, {self.discovered_added} added, "
+            f"{self.discovered_pending} waiting for the next refresh",
             f"lichess requests: {self.requests}, 429 pauses: {self.rate_limit_hits}, elapsed: {self.seconds:.0f}s",
         ]
         if self.refresh_truncated:
@@ -202,6 +207,8 @@ async def build_pool(
     if stale:
         log.info("refreshing %d previously pooled players not covered by team scans", len(stale))
     batches = [stale[i : i + PROFILE_BATCH] for i in range(0, len(stale), PROFILE_BATCH)]
+    profile_batches_used = 0
+    profile_fetch_blocked = False  # rate limited / HTTP error: do not spend more quota this run
     for b, batch in enumerate(batches):
         if b >= settings.max_profile_refresh_batches:
             log.warning("profile refresh cap reached (%d batches)", settings.max_profile_refresh_batches)
@@ -211,11 +218,14 @@ async def build_pool(
         except LichessRateLimited:
             log.error("rate limited during profile refresh; leaving remaining players untouched")
             result.errors.append("profile refresh rate limited")
+            profile_fetch_blocked = True
             break
         except LichessHTTPError as exc:
             log.warning("profile refresh batch %d failed: HTTP %s", b, exc.status_code)
             result.errors.append(f"profile refresh batch {b}: HTTP {exc.status_code}")
+            profile_fetch_blocked = True
             break
+        profile_batches_used += 1
         returned = {u["id"] for u in users if "id" in u}
         # IDs Lichess did not return no longer exist (closed accounts); count them as evaluated.
         evaluated |= set(batch)
@@ -227,6 +237,38 @@ async def build_pool(
         if missing:
             log.info("%d refreshed players no longer exist on Lichess", len(missing))
     result.refresh_truncated = sum(len(b) for b in batches) - result.refreshed
+
+    # Opponents discovered from game headers: look them up with whatever
+    # profile budget is left this run (same 8,000-per-10-minutes quota).
+    discovered = [] if profile_fetch_blocked else db.discovered_to_fetch()
+    remaining_batches = max(0, settings.max_profile_refresh_batches - profile_batches_used)
+    d_batches = [discovered[i : i + PROFILE_BATCH] for i in range(0, len(discovered), PROFILE_BATCH)]
+    if discovered:
+        log.info("looking up %d discovered opponents (%d batches available)", len(discovered), remaining_batches)
+    for b, batch in enumerate(d_batches):
+        if b >= remaining_batches:
+            log.info("profile budget used up; remaining discovered opponents wait for the next refresh")
+            break
+        try:
+            users = await client.users_by_ids(batch)
+        except LichessRateLimited:
+            log.error("rate limited while fetching discovered opponents; stopping for this run")
+            result.errors.append("opponent lookup rate limited")
+            break
+        except LichessHTTPError as exc:
+            log.warning("opponent lookup batch %d failed: HTTP %s", b, exc.status_code)
+            result.errors.append(f"opponent lookup batch {b}: HTTP {exc.status_code}")
+            break
+        result.discovered_fetched += len(batch)
+        new_rows = [
+            to_player_row(u, "opponent") for u in users if qualifies(u, settings, now_ms) and u["id"] not in qualifying
+        ]
+        qualifying.update({row.id: row for row in new_rows})
+        result.discovered_added += len(new_rows)
+        db.upsert_players(new_rows, updated_at=now_ms)
+        db.mark_discovered_fetched(batch)
+        log.info("opponent batch %d: %d looked up, %d qualify", b + 1, len(batch), len(new_rows))
+    result.discovered_pending = len(discovered) - result.discovered_fetched
 
     to_deactivate = [pid for pid in evaluated if pid not in qualifying]
     result.deactivated = db.deactivate_players(to_deactivate, updated_at=now_ms)

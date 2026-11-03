@@ -79,6 +79,12 @@ def cmd_show_pool(args: argparse.Namespace) -> int:
                 f"active blitz rating: min {stats['min_rating']}, avg {stats['avg_rating']}, "
                 f"max {stats['max_rating']}"
             )
+        sources = db.players_by_source()
+        if sources:
+            top = ", ".join(f"{src}: {n}" for src, n in list(sources.items())[:6])
+            print(f"active players by source: {top}{' …' if len(sources) > 6 else ''}")
+        disc = db.discovered_stats()
+        print(f"discovered opponents: {disc['total']} recorded, {disc['pending']} waiting for the next refresh")
         rows = db.active_players(limit=args.limit)
         if rows:
             print()
