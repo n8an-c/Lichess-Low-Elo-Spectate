@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 
 from .config import Settings
@@ -38,12 +39,51 @@ class Spectator:
             else None
         )
         self.on_accept: list[AcceptCallback] = []
+        self.recent: deque[GameInfo] = deque(maxlen=200)  # accepted games, newest first
         self.accepted_total = 0
         self.rejected_total = 0
         self.discovered_total = 0
         self.crashes = 0
         self.restart_delay = 5.0
+        self.started_at = time.time()
+        self._pool_size_cache: tuple[float, int] = (0.0, 0)
         self._tasks: list[asyncio.Task] = []
+
+    # -- feed for the web page -------------------------------------------------------
+
+    def record_accepted(self, game: GameInfo) -> None:
+        self.recent.appendleft(game)
+        self.accepted_total += 1
+        self.candidates.add(game)
+
+    def pool_size(self) -> int:
+        at, size = self._pool_size_cache
+        now = time.monotonic()
+        if now - at > 5:
+            try:
+                size = len(self.db.active_player_ids())
+            except Exception:  # closed database at shutdown: keep the last value
+                pass
+            self._pool_size_cache = (now, size)
+        return size
+
+    def stats(self) -> dict:
+        disc = self.db.discovered_stats() if self.db.conn else {"total": 0, "pending": 0}
+        return {
+            "mode": self.settings.detection.mode,
+            "poolSize": self.pool_size(),
+            "accepted": self.accepted_total,
+            "rejected": self.rejected_total,
+            "pollPasses": self.poller.passes if self.poller else None,
+            "streams": self.watcher.streams if self.watcher else None,
+            "discoveredPending": disc["pending"],
+            "uptimeSeconds": round(time.time() - self.started_at),
+        }
+
+    def feed(self, limit: int = 50) -> dict:
+        """Recent accepted games (newest first) plus service stats, for GET /api/games."""
+        now = time.time()
+        return {"games": [g.to_dict(now) for g in list(self.recent)[:limit]], "stats": self.stats(), "now": now}
 
     # -- opponent discovery --------------------------------------------------------
 
@@ -91,8 +131,7 @@ class Spectator:
                 verdict = await verify_game(self.client, game_id, self.settings, discover=self.discover)
                 self.db.record_game(game_id, verdict.accepted)
                 if verdict.accepted and verdict.game is not None:
-                    self.accepted_total += 1
-                    self.candidates.add(verdict.game)
+                    self.record_accepted(verdict.game)
                     log.info("ACCEPTED %s  %s", verdict.game.describe(), verdict.game.url)
                     for cb in self.on_accept:
                         try:

@@ -51,11 +51,25 @@ class GameInfo:
     created_at: int  # epoch ms
     plies_at_join: int
     detected_at: float = field(default_factory=time.monotonic)
+    found_at: float = field(default_factory=time.time)  # epoch seconds, for display
     fen: str | None = None
 
     @property
     def url(self) -> str:
         return f"https://lichess.org/{self.id}"
+
+    def to_dict(self, now: float | None = None) -> dict:
+        now = time.time() if now is None else now
+        return {
+            "id": self.id,
+            "url": self.url,
+            "white": self.white.__dict__,
+            "black": self.black.__dict__,
+            "pliesAtJoin": self.plies_at_join,
+            "createdAt": self.created_at,
+            "foundAt": self.found_at,
+            "ageSeconds": round(now - self.created_at / 1000) if self.created_at else None,
+        }
 
     def describe(self) -> str:
         return (

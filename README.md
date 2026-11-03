@@ -3,11 +3,11 @@
 A local web app that finds rated 3+0 blitz games on Lichess where both players
 are rated under 1000 and shows them live. See `SPEC.md` for the design.
 
-Current state: **all five milestones** (pool builder, poller, verifier, SSE API, live board with clocks, Next game, end-of-game handling and a Stockfish eval bar).
+Current state: pool builder, poller + games-by-users stream, verifier, opponent discovery, and a web page listing the games found with links to lichess.org.
 
 ## Setup
 
-Python 3.11+ and Node 20+ (for the frontend build) are required.
+Python 3.11+ is required. There is no frontend build step.
 
 ```bash
 python -m venv .venv
@@ -110,68 +110,31 @@ rejected AbCdEfGh: 14 plies already played
 poll pass 12: 164 players, 9 online, 3 playing, 1 in 3+0 games, 0 queued
 ```
 
-Accepted games are kept in memory for `candidate_ttl_seconds` (newest first)
-for the viewer in milestone 3. Every verified game ID is stored in
+Accepted games are listed on the web page (`serve`) and kept as candidates
+for `candidate_ttl_seconds`. Every verified game ID is stored in
 `seen_games` so it is never checked twice.
 
-## Run the web app (milestone 3)
-
-Build the frontend once (and again after changing anything under `frontend/`):
-
-```bash
-cd frontend
-npm install
-npm run build
-cd ..
-```
-
-Then start the backend, which also serves the built frontend:
+## Run the web app
 
 ```bash
 python -m backend.cli serve
 ```
 
-Open http://127.0.0.1:8000/. The page shows "Waiting for a qualifying game"
-(with the pool size and candidate count) until the poller finds one, then
-the board follows it live with both clocks running. When the game ends the
-final position stays on screen with the result ("Checkmate · Black wins",
-"White resigned · Black wins", "Draw", …) until you click **Next game** (or
-press `N`). During a live game the same button reads **Skip game**.
+Open http://127.0.0.1:8000/. The page lists every qualifying game found,
+newest first, with both players and ratings, the ply the game was found at,
+how long ago it started, and a **Watch on Lichess** link that opens the live
+game on lichess.org in a new tab. It refreshes itself every few seconds by
+polling the backend; nothing else runs in the browser. Games found in the
+last 90 seconds are highlighted; after about 8 minutes a 3+0 game is marked
+"probably finished".
 
-Eval bar (milestone 5): Stockfish 19 (the "lite single-threaded" WASM
-build, about 1.8 MB) runs in a Web Worker in the browser and evaluates each
-new position to `engine_depth` from `config.toml` (default 12). The bar
-shows white's share from white's perspective with the score (`+0.8`, `#3`)
-and the depth reached. **Eval: on/off** (or `E`) toggles it; the choice is
-remembered in the browser, and when it is off the engine is not running at
-all. Lower `engine_depth` if the bar lags behind the moves on your machine.
-The engine files are copied from the npm package into `frontend/public/engine/`
-by `npm run build` / `npm run dev`.
+API (local, no auth):
 
-Clocks: Lichess sends the remaining time with every move and delays live
-streams by 3 moves, so the browser runs the side-to-move clock down locally
-and snaps it to the real value on each move. Expect small corrections at
-every move; that is the delayed feed, not a bug. Like Lichess, the clocks
-only start after each side's first move.
-
-During frontend development run `npm run dev` inside `frontend/` as well and
-open http://127.0.0.1:5173/ instead; Vite proxies `/api` to the backend.
-
-API (all local, no auth):
-
-- `GET /api/state`: the current viewer snapshot.
-- `GET /api/events`: server-sent events. First event is `state`; then `game`
-  (a new game is being shown), `move` (`fen`, `lastMove`, `plies`, `wc`, `bc`,
-  `clockAt`), `end` (final state with `result`) and `waiting`.
-- `POST /api/next`: drop the current game and pick the next candidate.
-- `POST /api/watch/{gameId}?force=true`: debug aid that follows any game
-  regardless of the rating rules, e.g. a Lichess TV game, to try the UI. A
-  finished game shows its final position and result straight away.
-- `GET /api/candidates`: the accepted games waiting to be shown.
-- `GET /api/config`: settings the browser needs (`engineDepth`).
-
-Lichess delays live game streams by 3 moves, so the board (and the ply
-count) runs slightly behind the real game.
+- `GET /api/games?limit=50`: recent accepted games (newest first) with
+  `url`, players, `pliesAtJoin`, `createdAt`, `foundAt`, `ageSeconds`, plus
+  `stats` (pool size, detection mode, accepted/rejected counts, discovered
+  opponents waiting, uptime).
+- `GET /api/candidates`: accepted games still within the late-join window.
 
 ## Tests
 

@@ -4,38 +4,96 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Low-ELO Lichess Spectator</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; display: flex; justify-content: center; }
+      main { width: min(92vw, 760px); padding: 1.25rem 0 3rem; }
+      h1 { font-size: 1.2rem; margin: 0 0 0.25rem; }
+      .stats { font-size: 0.85rem; opacity: 0.75; margin: 0 0 1rem; }
+      .stats.error { color: #d33; opacity: 1; }
+      ul { list-style: none; padding: 0; margin: 0; }
+      li { padding: 0.7rem 0.6rem; border-top: 1px solid rgba(127, 127, 127, 0.25); display: grid;
+           grid-template-columns: 1fr auto; gap: 0.25rem 1rem; align-items: center; }
+      li:first-child { border-top: 0; }
+      li.fresh { background: rgba(118, 150, 86, 0.12); }
+      li.stale { opacity: 0.55; }
+      .players { font-size: 1.05rem; }
+      .players .rating { opacity: 0.7; font-size: 0.9em; }
+      .meta { font-size: 0.8rem; opacity: 0.75; grid-column: 1; }
+      a.watch { font-weight: 600; text-decoration: none; padding: 0.35rem 0.8rem; border-radius: 6px;
+                border: 1px solid currentColor; grid-row: 1 / span 2; }
+      .empty { padding: 2rem 0; opacity: 0.7; }
+      code { font-size: 0.85em; }
+    </style>
   </head>
   <body>
-    <main id="app">
-      <header class="topbar">
-        <h1>Low-ELO Spectator</h1>
-        <span class="controls">
-          <button id="eval-toggle" type="button" title="Shortcut: E">Eval: on</button>
-          <button id="next" type="button" title="Shortcut: N">Next game</button>
-        </span>
-      </header>
-      <section class="game">
-        <div class="player" id="black">
-          <span class="who"><span class="name">—</span> <span class="rating"></span></span>
-          <span class="clock" id="clock-black">–:––</span>
-        </div>
-        <div class="board-row">
-          <div id="eval-bar" class="eval-bar" title="Stockfish evaluation (white's perspective)">
-            <div class="eval-white"></div>
-            <span class="eval-label" id="eval-label"></span>
-            <span class="eval-depth" id="eval-depth"></span>
-          </div>
-          <div id="board" class="cg-wrap"></div>
-        </div>
-        <div class="player" id="white">
-          <span class="who"><span class="name">—</span> <span class="rating"></span></span>
-          <span class="clock" id="clock-white">–:––</span>
-        </div>
-      </section>
-      <p id="result" class="result" hidden></p>
-      <p id="status" class="status">Connecting…</p>
-      <p id="link" class="link"></p>
+    <main>
+      <h1>Low-ELO Lichess Spectator</h1>
+      <p class="stats" id="stats">Connecting…</p>
+      <ul id="games"></ul>
+      <p class="empty" id="empty" hidden>No qualifying games yet. Rated 3+0 games between players under the
+        rating cap appear here within seconds of starting; each link opens the live game on lichess.org.</p>
     </main>
-    <script type="module" src="/src/main.ts"></script>
+    <script>
+      const REFRESH_MS = 4000;
+      const FRESH_SECONDS = 90;   // a game found this recently is still near the start
+      const STALE_SECONDS = 480;  // a 3+0 game is almost certainly over after 8 minutes
+      const gamesEl = document.getElementById("games");
+      const statsEl = document.getElementById("stats");
+      const emptyEl = document.getElementById("empty");
+
+      function ago(seconds) {
+        if (seconds < 60) return `${seconds}s ago`;
+        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+        return `${Math.floor(seconds / 3600)}h ago`;
+      }
+
+      function player(p) {
+        const name = p.title ? `${p.title} ${p.name}` : p.name;
+        return `${escapeHtml(name)} <span class="rating">(${p.rating})</span>`;
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      }
+
+      function render(data) {
+        const now = data.now;
+        gamesEl.innerHTML = "";
+        for (const g of data.games) {
+          const age = g.ageSeconds ?? Math.round(now - g.foundAt);
+          const li = document.createElement("li");
+          li.className = age < FRESH_SECONDS ? "fresh" : age > STALE_SECONDS ? "stale" : "";
+          const state = age > STALE_SECONDS ? "probably finished" : age < FRESH_SECONDS ? "just started" : "in progress";
+          li.innerHTML =
+            `<div class="players">${player(g.white)} vs ${player(g.black)}</div>` +
+            `<a class="watch" href="${g.url}" target="_blank" rel="noopener">Watch on Lichess ↗</a>` +
+            `<div class="meta">found ${ago(Math.round(now - g.foundAt))} at ply ${g.pliesAtJoin} · started ${ago(age)} · ${state} · <code>${g.id}</code></div>`;
+          gamesEl.appendChild(li);
+        }
+        emptyEl.hidden = data.games.length > 0;
+        const s = data.stats;
+        const detectors = s.mode === "both" ? "polling + stream" : s.mode === "poll" ? "polling" : "stream";
+        statsEl.className = "stats";
+        statsEl.textContent =
+          `${s.poolSize} players in the pool · ${detectors} · ${s.accepted} games found, ${s.rejected} rejected` +
+          (s.discoveredPending ? ` · ${s.discoveredPending} opponents waiting for the next pool refresh` : "") +
+          ` · refreshes every ${REFRESH_MS / 1000}s`;
+      }
+
+      async function refresh() {
+        try {
+          const r = await fetch("/api/games?limit=50", { cache: "no-store" });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          render(await r.json());
+        } catch (e) {
+          statsEl.className = "stats error";
+          statsEl.textContent = `Cannot reach the backend (${e.message}); retrying…`;
+        }
+      }
+
+      refresh();
+      setInterval(refresh, REFRESH_MS);
+    </script>
   </body>
 </html>
