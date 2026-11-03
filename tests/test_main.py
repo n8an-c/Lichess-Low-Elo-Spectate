@@ -40,6 +40,9 @@ async def test_state_next_and_events(tmp_path, monkeypatch):
             r = await http.get("/api/candidates")
             assert r.json() == []
 
+            r = await http.get("/api/config")
+            assert r.json() == {"engineDepth": 12, "engine": "stockfish-19-lite-single"}
+
             r = await http.post("/api/watch/short")
             assert r.status_code == 400
 

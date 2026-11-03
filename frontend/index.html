@@ -9,14 +9,24 @@
     <main id="app">
       <header class="topbar">
         <h1>Low-ELO Spectator</h1>
-        <button id="next" type="button" title="Shortcut: N">Next game</button>
+        <span class="controls">
+          <button id="eval-toggle" type="button" title="Shortcut: E">Eval: on</button>
+          <button id="next" type="button" title="Shortcut: N">Next game</button>
+        </span>
       </header>
       <section class="game">
         <div class="player" id="black">
           <span class="who"><span class="name">—</span> <span class="rating"></span></span>
           <span class="clock" id="clock-black">–:––</span>
         </div>
-        <div id="board" class="cg-wrap"></div>
+        <div class="board-row">
+          <div id="eval-bar" class="eval-bar" title="Stockfish evaluation (white's perspective)">
+            <div class="eval-white"></div>
+            <span class="eval-label" id="eval-label"></span>
+            <span class="eval-depth" id="eval-depth"></span>
+          </div>
+          <div id="board" class="cg-wrap"></div>
+        </div>
         <div class="player" id="white">
           <span class="who"><span class="name">—</span> <span class="rating"></span></span>
           <span class="clock" id="clock-white">–:––</span>

@@ -97,9 +97,101 @@ body[data-status="finished"] #next {
   border-color: var(--low);
 }
 
+.controls {
+  display: flex;
+  gap: 0.5rem;
+}
+
+#eval-toggle {
+  font: inherit;
+  padding: 0.4rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.8;
+}
+
+.board-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+}
+
 .cg-wrap {
   width: var(--board-size);
   height: var(--board-size);
+}
+
+.eval-bar {
+  position: relative;
+  width: 1.4rem;
+  height: var(--board-size);
+  border-radius: 4px;
+  overflow: hidden;
+  background: #403d39; /* black's share */
+  flex: none;
+}
+
+.eval-bar[hidden] {
+  display: none;
+}
+
+.eval-white {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 50%;
+  background: #f0f0f0;
+  transition: height 0.4s ease;
+}
+
+.eval-label,
+.eval-depth {
+  position: absolute;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.6rem;
+  line-height: 1.2;
+}
+
+.eval-label {
+  bottom: 0.2rem; /* white ahead: label sits in white's area */
+  color: #222;
+  font-weight: 700;
+}
+
+.eval-bar.black-ahead .eval-label {
+  bottom: auto;
+  top: 0.2rem;
+  color: #eee;
+}
+
+.eval-depth {
+  top: 0.2rem;
+  color: #bbb;
+  font-size: 0.5rem;
+}
+
+.eval-bar.black-ahead .eval-depth {
+  top: auto;
+  bottom: 0.2rem;
+  color: #666;
+}
+
+body[data-eval="off"] .board-row {
+  justify-content: center;
+}
+
+/* keep the board full size when the bar is shown: shrink the app width slightly on narrow screens */
+@media (max-width: 700px) {
+  :root {
+    --board-size: min(84vw, 70vh);
+  }
 }
 
 .result {

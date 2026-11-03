@@ -3,7 +3,7 @@
 A local web app that finds rated 3+0 blitz games on Lichess where both players
 are rated under 1000 and shows them live. See `SPEC.md` for the design.
 
-Current state: **milestone 4** (pool builder, poller, verifier, SSE API, live board with clocks, Next game and end-of-game handling).
+Current state: **all five milestones** (pool builder, poller, verifier, SSE API, live board with clocks, Next game, end-of-game handling and a Stockfish eval bar).
 
 ## Setup
 
@@ -105,6 +105,16 @@ final position stays on screen with the result ("Checkmate · Black wins",
 "White resigned · Black wins", "Draw", …) until you click **Next game** (or
 press `N`). During a live game the same button reads **Skip game**.
 
+Eval bar (milestone 5): Stockfish 19 (the "lite single-threaded" WASM
+build, about 1.8 MB) runs in a Web Worker in the browser and evaluates each
+new position to `engine_depth` from `config.toml` (default 12). The bar
+shows white's share from white's perspective with the score (`+0.8`, `#3`)
+and the depth reached. **Eval: on/off** (or `E`) toggles it; the choice is
+remembered in the browser, and when it is off the engine is not running at
+all. Lower `engine_depth` if the bar lags behind the moves on your machine.
+The engine files are copied from the npm package into `frontend/public/engine/`
+by `npm run build` / `npm run dev`.
+
 Clocks: Lichess sends the remaining time with every move and delays live
 streams by 3 moves, so the browser runs the side-to-move clock down locally
 and snaps it to the real value on each move. Expect small corrections at
@@ -125,6 +135,7 @@ API (all local, no auth):
   regardless of the rating rules, e.g. a Lichess TV game, to try the UI. A
   finished game shows its final position and result straight away.
 - `GET /api/candidates`: the accepted games waiting to be shown.
+- `GET /api/config`: settings the browser needs (`engineDepth`).
 
 Lichess delays live game streams by 3 moves, so the board (and the ply
 count) runs slightly behind the real game.

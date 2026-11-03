@@ -65,6 +65,11 @@ def create_app(settings: Settings, *, skip_pool_build: bool = False, client: Lic
     async def get_state(request: Request) -> dict:
         return request.app.state.viewer.snapshot()
 
+    @app.get("/api/config")
+    async def get_config() -> dict:
+        """Settings the browser needs (the engine runs entirely client-side)."""
+        return {"engineDepth": settings.viewer.engine_depth, "engine": "stockfish-19-lite-single"}
+
     @app.get("/api/candidates")
     async def get_candidates(request: Request) -> list[dict]:
         return [

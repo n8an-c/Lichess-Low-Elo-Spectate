@@ -3,6 +3,8 @@ import type { Api } from "chessground/api";
 import type { Key } from "chessground/types";
 import "./style.css";
 import { clockRunning, describeResult, formatClock, remainingSeconds, sideToMove, type Color } from "./clock";
+import { Engine, type EvalUpdate } from "./engine";
+import { formatEval, whiteShare } from "./evalmath";
 import type { MoveEvent, ViewerState } from "./types";
 
 const boardEl = document.getElementById("board")!;
@@ -19,8 +21,16 @@ const playerEls: Record<Color, HTMLElement> = {
   black: document.getElementById("black")!,
 };
 
+const evalBarEl = document.getElementById("eval-bar")!;
+const evalWhiteEl = evalBarEl.querySelector(".eval-white") as HTMLElement;
+const evalLabelEl = document.getElementById("eval-label")!;
+const evalDepthEl = document.getElementById("eval-depth")!;
+const evalToggleBtn = document.getElementById("eval-toggle") as HTMLButtonElement;
+
 const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const LOW_TIME_SECONDS = 10;
+const DEFAULT_DEPTH = 12;
+const EVAL_PREF_KEY = "evalBar";
 
 const cg: Api = Chessground(boardEl, {
   fen: START_FEN,
@@ -34,6 +44,93 @@ const cg: Api = Chessground(boardEl, {
 let current: ViewerState | null = null;
 let connected = false;
 let nextPending = false;
+
+// -- eval bar / engine ---------------------------------------------------------
+
+let evalEnabled = (() => {
+  try {
+    return localStorage.getItem(EVAL_PREF_KEY) !== "off";
+  } catch {
+    return true;
+  }
+})();
+
+const engine = new Engine(DEFAULT_DEPTH, {
+  onReady: () => {
+    document.body.dataset.engine = "ready";
+    if (current?.fen && current.status !== "waiting") engine.evaluate(current.fen);
+  },
+  onEval: showEval,
+  onError: (msg) => {
+    console.error(msg);
+    document.body.dataset.engine = "error";
+    evalLabelEl.textContent = "n/a";
+    evalDepthEl.textContent = "engine unavailable";
+  },
+});
+
+function showEval(update: EvalUpdate) {
+  if (!current || update.fen !== current.fen) return; // stale result for an older position
+  const blackToMove = sideToMove(update.fen) === "black";
+  const share = whiteShare(update, blackToMove);
+  evalWhiteEl.style.height = `${(share * 100).toFixed(1)}%`;
+  evalLabelEl.textContent = formatEval(update);
+  evalBarEl.classList.toggle("black-ahead", share < 0.5);
+  evalDepthEl.textContent = `d${update.depth}`;
+}
+
+function clearEval() {
+  evalWhiteEl.style.height = "50%";
+  evalLabelEl.textContent = "";
+  evalDepthEl.textContent = "";
+  evalBarEl.classList.remove("black-ahead");
+}
+
+function requestEval() {
+  if (!evalEnabled || !current) return;
+  if (current.status === "waiting" || !current.fen) {
+    clearEval();
+    return;
+  }
+  engine.evaluate(current.fen);
+}
+
+function applyEvalPreference() {
+  document.body.dataset.eval = evalEnabled ? "on" : "off";
+  evalToggleBtn.textContent = `Eval: ${evalEnabled ? "on" : "off"}`;
+  evalBarEl.hidden = !evalEnabled;
+  if (evalEnabled) {
+    document.body.dataset.engine = "loading";
+    engine.start();
+    requestEval();
+  } else {
+    engine.stop();
+    document.body.dataset.engine = "off";
+    clearEval();
+  }
+}
+
+function toggleEval() {
+  evalEnabled = !evalEnabled;
+  try {
+    localStorage.setItem(EVAL_PREF_KEY, evalEnabled ? "on" : "off");
+  } catch {
+    // private mode etc.: preference just does not persist
+  }
+  applyEvalPreference();
+}
+
+evalToggleBtn.addEventListener("click", toggleEval);
+
+async function loadConfig() {
+  try {
+    const r = await fetch("/api/config");
+    const cfg = (await r.json()) as { engineDepth?: number };
+    if (cfg.engineDepth && cfg.engineDepth > 0) engine.setDepth(cfg.engineDepth);
+  } catch {
+    // keep the default depth
+  }
+}
 
 // -- board ---------------------------------------------------------------------
 
@@ -123,6 +220,7 @@ function render(state: ViewerState) {
   document.body.dataset.status = state.status;
   renderButton(state);
   renderClocks();
+  requestEval();
 }
 
 function onMove(move: MoveEvent) {
@@ -131,6 +229,7 @@ function onMove(move: MoveEvent) {
   applyPosition(move.fen, move.lastMove);
   statusEl.textContent = `Live · ply ${move.plies}`;
   renderClocks();
+  requestEval();
 }
 
 // -- SSE -----------------------------------------------------------------------
@@ -176,7 +275,10 @@ async function requestNext() {
 
 nextBtn.addEventListener("click", requestNext);
 document.addEventListener("keydown", (e) => {
-  if ((e.key === "n" || e.key === "N") && !e.metaKey && !e.ctrlKey && !e.altKey) requestNext();
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "n" || e.key === "N") requestNext();
+  if (e.key === "e" || e.key === "E") toggleEval();
 });
 
+loadConfig().then(applyEvalPreference);
 connect();
