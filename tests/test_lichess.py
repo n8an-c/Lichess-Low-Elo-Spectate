@@ -4,7 +4,14 @@ import json
 import httpx
 import pytest
 
-from backend.lichess import LichessClient, LichessHTTPError, LichessRateLimited, LichessSettings
+from backend.lichess import (
+    LichessClient,
+    LichessError,
+    LichessHTTPError,
+    LichessRateLimited,
+    LichessSettings,
+    LichessTransportError,
+)
 
 
 def make_client(handler, pause=0.2, delay=0.0):
@@ -109,6 +116,35 @@ async def test_open_stream_does_not_block_other_requests():
         release.set()
         assert (await anext(stream))["n"] == 2
         await stream.aclose()
+
+
+async def test_transport_errors_become_lichess_errors():
+    def handler(request):
+        raise httpx.ConnectError("boom", request=request)
+
+    async with make_client(handler) as client:
+        with pytest.raises(LichessTransportError) as exc:
+            await client.get_json("/api/x")
+        assert isinstance(exc.value, LichessError)
+        assert "ConnectError" in str(exc.value)
+        # the client is still usable afterwards (lock released)
+        with pytest.raises(LichessTransportError):
+            await asyncio.wait_for(client.get_json("/api/y"), 1)
+
+
+async def test_stream_dropping_mid_body_raises_transport_error():
+    async def body():
+        yield b'{"n": 1}\n'
+        raise httpx.ReadError("connection reset")
+
+    def handler(request):
+        return httpx.Response(200, content=body())
+
+    async with make_client(handler) as client:
+        stream = client.stream_game("abc")
+        assert (await anext(stream))["n"] == 1
+        with pytest.raises(LichessTransportError):
+            await anext(stream)
 
 
 async def test_users_by_ids_posts_text_plain():

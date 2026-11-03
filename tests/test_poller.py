@@ -36,6 +36,31 @@ def test_detect_filters_and_dedupes(tmp_path):
     db.close()
 
 
+async def test_run_survives_network_errors(tmp_path):
+    db = Database(tmp_path / "p.sqlite3")
+    from backend.db import PlayerRow
+
+    db.upsert_players([PlayerRow("u1", "U1", 800, False, 0)])
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json=[{"id": "u1", "name": "U1", "playing": {"id": "g-after", "clock": "3+0"}}])
+
+    client = LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=httpx.MockTransport(handler))
+    queue: asyncio.Queue = asyncio.Queue()
+    poller = Poller(client, db, DetectionSettings(poll_interval_seconds=0), queue)
+    task = asyncio.create_task(poller.run())
+    assert await asyncio.wait_for(queue.get(), 2) == "g-after"
+    task.cancel()
+    assert calls >= 2
+    await client.aclose()
+    db.close()
+
+
 async def test_run_queues_games_and_batches_by_100(tmp_path):
     db = Database(tmp_path / "p.sqlite3")
     from backend.db import PlayerRow

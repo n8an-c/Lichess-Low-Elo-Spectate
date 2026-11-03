@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -35,9 +36,19 @@ def create_app(settings: Settings, *, skip_pool_build: bool = False, client: Lic
         def stats() -> dict:
             now = asyncio.get_event_loop().time()
             if now - pool_cache["at"] > 5:
-                pool_cache["size"] = len(spectator.db.active_player_ids())
+                try:
+                    pool_cache["size"] = len(spectator.db.active_player_ids())
+                except sqlite3.ProgrammingError:  # database closed (shutdown); keep the last value
+                    pass
                 pool_cache["at"] = now
             return {"candidates": len(spectator.candidates), "poolSize": pool_cache["size"]}
+
+        def report_exit(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.error("%s task died: %r", task.get_name(), exc, exc_info=exc)
 
         viewer = Viewer(spectator.client, spectator.candidates, settings, broadcaster, stats=stats)
         spectator.on_accept.append(viewer.notify_candidate)
@@ -47,6 +58,8 @@ def create_app(settings: Settings, *, skip_pool_build: bool = False, client: Lic
             asyncio.create_task(spectator.run(), name="spectator"),
             asyncio.create_task(viewer.run(), name="viewer"),
         ]
+        for task in tasks:
+            task.add_done_callback(report_exit)
         try:
             yield
         finally:

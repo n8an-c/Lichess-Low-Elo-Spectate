@@ -82,6 +82,10 @@ class Poller:
                     log.warning("status poll failed (%s); continuing", exc)
                     await asyncio.sleep(self.settings.poll_interval_seconds)
                     continue
+                except Exception:
+                    log.exception("status poll crashed; continuing with the next batch")
+                    await asyncio.sleep(self.settings.poll_interval_seconds)
+                    continue
                 for game_id in self.detect(statuses):
                     log.info("found %s game %s (https://lichess.org/%s); verifying", self.settings.time_control, game_id, game_id)
                     await self.queue.put(game_id)

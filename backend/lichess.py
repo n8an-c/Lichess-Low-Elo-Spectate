@@ -34,6 +34,10 @@ class LichessRateLimited(LichessError):
     """Raised when a request is still rejected with 429 after the pause."""
 
 
+class LichessTransportError(LichessError):
+    """A network-level failure (timeout, connection reset, protocol error)."""
+
+
 class LichessHTTPError(LichessError):
     def __init__(self, response: httpx.Response):
         self.status_code = response.status_code
@@ -90,7 +94,10 @@ class LichessClient:
             await self._wait_if_paused()
             self.request_count += 1
             log.debug("Lichess %s %s (attempt %d)", request.method, request.url, attempt)
-            response = await self._http.send(request, stream=stream)
+            try:
+                response = await self._http.send(request, stream=stream)
+            except httpx.HTTPError as exc:  # timeouts, connection errors, protocol errors
+                raise LichessTransportError(f"{type(exc).__name__}: {exc or request.url}") from exc
             if response.status_code != 429:
                 return response
             await response.aclose()
@@ -151,6 +158,8 @@ class LichessClient:
                 line = line.strip()
                 if line:
                     yield json.loads(line)
+        except httpx.HTTPError as exc:
+            raise LichessTransportError(f"{type(exc).__name__} while streaming {request.url}: {exc}") from exc
         finally:
             await response.aclose()
 

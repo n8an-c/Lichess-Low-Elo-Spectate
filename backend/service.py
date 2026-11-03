@@ -31,6 +31,8 @@ class Spectator:
         self.on_accept: list[AcceptCallback] = []
         self.accepted_total = 0
         self.rejected_total = 0
+        self.crashes = 0
+        self.restart_delay = 5.0
         self._tasks: list[asyncio.Task] = []
 
     # -- background loops --------------------------------------------------------
@@ -92,13 +94,30 @@ class Spectator:
 
     # -- lifecycle -----------------------------------------------------------------
 
+    async def _supervise(self, name: str, factory, restart_delay: float = 5.0) -> None:
+        """Run a loop forever; log and restart it if it crashes. Only cancellation stops it."""
+        while True:
+            try:
+                await factory()
+                log.error("%s loop returned unexpectedly; restarting in %.0fs", name, restart_delay)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("%s loop crashed; restarting in %.0fs", name, restart_delay)
+                self.crashes += 1
+            await asyncio.sleep(restart_delay)
+
     async def run(self) -> None:
-        """Run all loops until cancelled."""
+        """Run all loops until cancelled. A crashing loop is restarted, never fatal."""
+        loops = {
+            "pool": self.pool_loop,
+            "poller": self.poller.run,
+            "verifier": self.verifier_loop,
+            "expiry": self.expiry_loop,
+        }
         self._tasks = [
-            asyncio.create_task(self.pool_loop(), name="pool"),
-            asyncio.create_task(self.poller.run(), name="poller"),
-            asyncio.create_task(self.verifier_loop(), name="verifier"),
-            asyncio.create_task(self.expiry_loop(), name="expiry"),
+            asyncio.create_task(self._supervise(name, factory, self.restart_delay), name=name)
+            for name, factory in loops.items()
         ]
         try:
             await asyncio.gather(*self._tasks)
