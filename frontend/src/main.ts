@@ -99,6 +99,9 @@ function applyEvalPreference() {
   document.body.dataset.eval = evalEnabled ? "on" : "off";
   evalToggleBtn.textContent = `Eval: ${evalEnabled ? "on" : "off"}`;
   evalBarEl.hidden = !evalEnabled;
+  // The bar is positioned outside the board's box, so this should be a no-op,
+  // but let chessground re-measure its bounds after any layout change.
+  cg.redrawAll();
   if (evalEnabled) {
     document.body.dataset.engine = "loading";
     engine.start();
@@ -280,5 +283,6 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "e" || e.key === "E") toggleEval();
 });
 
+window.addEventListener("load", () => cg.redrawAll()); // re-measure once stylesheets/fonts have settled
 loadConfig().then(applyEvalPreference);
 connect();

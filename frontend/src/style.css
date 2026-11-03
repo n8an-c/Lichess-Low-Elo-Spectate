@@ -5,7 +5,8 @@
 :root {
   color-scheme: light dark;
   font-family: system-ui, sans-serif;
-  --board-size: min(90vw, 70vh);
+  /* leave a gutter on each side for the eval bar, so toggling it never resizes the board */
+  --board-size: min(calc(90vw - 3rem), 70vh);
   --accent: #769656;
   --low: #d33;
 }
@@ -113,25 +114,31 @@ body[data-status="finished"] #next {
   opacity: 0.8;
 }
 
+/* The board is laid out on its own; the eval bar floats in the left gutter
+   (absolutely positioned) so showing or hiding it never moves or resizes
+   the board, which chessground measures once for piece placement. */
 .board-row {
-  display: flex;
-  align-items: stretch;
-  gap: 0.5rem;
+  position: relative;
+  width: var(--board-size);
+  height: var(--board-size);
 }
 
 .cg-wrap {
+  flex: none;
   width: var(--board-size);
   height: var(--board-size);
 }
 
 .eval-bar {
-  position: relative;
+  position: absolute;
+  top: 0;
+  right: 100%;
+  margin-right: 0.5rem;
   width: 1.4rem;
-  height: var(--board-size);
+  height: 100%;
   border-radius: 4px;
   overflow: hidden;
   background: #403d39; /* black's share */
-  flex: none;
 }
 
 .eval-bar[hidden] {
@@ -183,16 +190,6 @@ body[data-status="finished"] #next {
   color: #666;
 }
 
-body[data-eval="off"] .board-row {
-  justify-content: center;
-}
-
-/* keep the board full size when the bar is shown: shrink the app width slightly on narrow screens */
-@media (max-width: 700px) {
-  :root {
-    --board-size: min(84vw, 70vh);
-  }
-}
 
 .result {
   margin: 0.75rem 0 0;
