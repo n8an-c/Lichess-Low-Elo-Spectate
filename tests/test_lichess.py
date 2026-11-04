@@ -60,6 +60,56 @@ async def test_pause_applies_to_other_requests():
     assert times[1] - times[0] >= 0.19
 
 
+async def test_request_spacing_is_enforced_between_starts_not_as_idle_sleep():
+    times = []
+
+    def handler(request):
+        times.append(asyncio.get_event_loop().time())
+        return httpx.Response(200, json={})
+
+    settings = LichessSettings(courtesy_delay_seconds=0.15, rate_limit_pause_seconds=1)
+    async with LichessClient(settings, transport=httpx.MockTransport(handler)) as client:
+        t0 = asyncio.get_event_loop().time()
+        await client.get_json("/api/a")  # returns immediately: no sleep after the response
+        assert asyncio.get_event_loop().time() - t0 < 0.1
+        await client.get_json("/api/b")  # ...but the next request waits for the spacing
+        assert times[1] - times[0] >= 0.14
+        await asyncio.sleep(0.2)  # the caller did its own work meanwhile
+        t2 = asyncio.get_event_loop().time()
+        await client.get_json("/api/c")  # no extra wait when the spacing already elapsed
+        assert asyncio.get_event_loop().time() - t2 < 0.1
+        assert client.requests_per_minute() == 3
+
+
+async def test_user_games_params():
+    captured = {}
+
+    def handler(request):
+        captured.update(path=request.url.path, params=dict(request.url.params), accept=request.headers["accept"])
+        return httpx.Response(200, text='{"id": "g1"}\n')
+
+    async with make_client(handler) as client:
+        docs = [d async for d in client.user_games("Alice", max_games=50, since_ms=123)]
+        assert docs == [{"id": "g1"}]
+        assert captured["path"] == "/api/games/user/Alice"
+        assert captured["params"] == {"max": "50", "moves": "false", "rated": "true", "perfType": "blitz", "since": "123"}
+        assert captured["accept"] == "application/x-ndjson"
+
+
+async def test_429_honours_retry_after_when_longer():
+    codes = iter([429, 200])
+    times = []
+
+    def handler(request):
+        times.append(asyncio.get_event_loop().time())
+        code = next(codes)
+        return httpx.Response(code, json={}, headers={"Retry-After": "0.3"} if code == 429 else {})
+
+    async with make_client(handler, pause=0.05) as client:
+        await client.get_json("/api/x")
+    assert times[1] - times[0] >= 0.29
+
+
 async def test_requests_are_serialised():
     active = 0
     max_active = 0

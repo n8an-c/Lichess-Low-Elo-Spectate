@@ -88,6 +88,20 @@ async def test_handle_rejects(tmp_path, over):
     db.close()
 
 
+async def test_handle_rating_rule_either_and_time_control_list(tmp_path):
+    watcher, db, client, queue, _, _ = make_watcher(tmp_path)
+    watcher.settings = Settings(pool=PoolSettings(rating_cap=1000),
+                                detection=DetectionSettings(rating_rule="either", time_controls=["3+0", "5+0"]))
+    mixed = {"white": {"userId": "alice", "rating": 1400}, "black": {"userId": "bob", "rating": 900}}
+    assert watcher.handle(doc("g1", players=mixed)) == "g1"
+    assert watcher.handle(doc("g2", players=mixed, clock={"initial": 300, "increment": 0})) == "g2"
+    assert watcher.handle(doc("g3", players=mixed, clock={"initial": 300, "increment": 3})) is None
+    strong = {"white": {"userId": "alice", "rating": 1400}, "black": {"userId": "bob", "rating": 1000}}
+    assert watcher.handle(doc("g4", players=strong)) is None
+    await client.aclose()
+    db.close()
+
+
 async def test_handle_discovers_both_players_even_when_game_is_rejected(tmp_path):
     seen = []
     watcher, db, client, queue, _, _ = make_watcher(tmp_path, discover=lambda uid, rating: seen.append((uid, rating)))

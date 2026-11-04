@@ -16,7 +16,7 @@ import logging
 import time
 from contextlib import aclosing
 
-from .config import Settings
+from .config import Settings, parse_time_control  # noqa: F401  (re-exported for callers/tests)
 from .db import Database
 from .lichess import LichessClient, LichessError
 from .verifier import DiscoverCallback
@@ -25,15 +25,6 @@ log = logging.getLogger(__name__)
 
 STREAM_BATCH = 300
 LIVE_STATUSES = {"created", "started"}
-
-
-def parse_time_control(time_control: str) -> tuple[int, int] | None:
-    """'3+0' -> (180, 0); None if the string is not minutes+increment."""
-    try:
-        minutes, inc = time_control.split("+")
-        return int(float(minutes) * 60), int(inc)
-    except ValueError:
-        return None
 
 
 class GameStreamWatcher:
@@ -76,12 +67,13 @@ class GameStreamWatcher:
         self.queued += 1
         log.info(
             "stream: found %s game %s (https://lichess.org/%s); verifying",
-            self.settings.detection.time_control, game_id, game_id,
+            self.settings.detection.label, game_id, game_id,
         )
         return game_id
 
     def _skip_reason(self, doc: dict) -> str | None:
         """Why a games-by-users document should not be queued, or None if it should."""
+        det = self.settings.detection
         if doc.get("statusName") not in LIVE_STATUSES:
             return f"status {doc.get('statusName')}"  # finish events and aborted games
         if not doc.get("rated"):
@@ -89,29 +81,38 @@ class GameStreamWatcher:
         if doc.get("variant") != "standard":
             return f"variant {doc.get('variant')}"
         clock = doc.get("clock") or {}
-        expected = parse_time_control(self.settings.detection.time_control)
         got = (clock.get("initial"), clock.get("increment"))
-        if expected is not None and got != expected:
+        if got not in det.clock_pairs():
             return f"clock {got[0]}+{got[1]}"
         players = doc.get("players") or {}
         sides = [players.get("white") or {}, players.get("black") or {}]
-        # Both players of a rated standard 3+0 game are worth knowing about,
-        # even when the game itself is rejected on rating.
+        # Both players of a rated standard game with an allowed clock are
+        # worth knowing about, even when the game itself is rejected on rating.
         if self.discover is not None:
             for side in sides:
                 uid, rating = side.get("userId"), side.get("rating")
-                if uid and isinstance(rating, int):
+                if uid and isinstance(rating, int) and not side.get("provisional"):
                     try:
                         self.discover(uid, rating)
                     except Exception:
                         log.exception("discover callback failed for %s", uid)
         cap = self.settings.pool.rating_cap
+        ratings = []
         for side in sides:
             rating = side.get("rating")
             if not isinstance(rating, int):
                 return "anonymous or computer player"
-            if rating >= cap:
-                return f"{side.get('userId')} rated {rating} >= {cap}"
+            if side.get("provisional"):
+                return f"{side.get('userId')} has a provisional rating"
+            ratings.append((side.get("userId"), rating))
+        under = [uid for uid, r in ratings if r < cap]
+        if det.rating_rule == "either":
+            if not under:
+                return f"neither player under {cap}"
+        else:
+            for uid, rating in ratings:
+                if rating >= cap:
+                    return f"{uid} rated {rating} >= {cap}"
         if doc["id"] in self.pending:
             return "already queued"
         if self.db.game_seen(doc["id"]):

@@ -31,8 +31,9 @@
       <h1>Low-ELO Lichess Spectator</h1>
       <p class="stats" id="stats">Connecting…</p>
       <ul id="games"></ul>
-      <p class="empty" id="empty" hidden>No qualifying games yet. Rated 3+0 games between players under the
-        rating cap appear here within seconds of starting; each link opens the live game on lichess.org.</p>
+      <p class="empty" id="empty" hidden>No qualifying games yet. Rated games with the configured time controls
+        between players under the rating cap appear here within seconds of starting; each link opens the live game
+        on lichess.org. If the pool is still being built, give it a few minutes.</p>
     </main>
     <script>
       const REFRESH_MS = 4000;
@@ -65,19 +66,25 @@
           const li = document.createElement("li");
           li.className = age < FRESH_SECONDS ? "fresh" : age > STALE_SECONDS ? "stale" : "";
           const state = age > STALE_SECONDS ? "probably finished" : age < FRESH_SECONDS ? "just started" : "in progress";
+          const ply = g.estimatedPlies ?? g.pliesAtJoin;
           li.innerHTML =
             `<div class="players">${player(g.white)} vs ${player(g.black)}</div>` +
             `<a class="watch" href="${g.url}" target="_blank" rel="noopener">Watch on Lichess ↗</a>` +
-            `<div class="meta">found ${ago(Math.round(now - g.foundAt))} at ply ${g.pliesAtJoin} · started ${ago(age)} · ${state} · <code>${g.id}</code></div>`;
+            `<div class="meta">found ${ago(Math.round(now - g.foundAt))} at about ply ${ply} · started ${ago(age)} · ${state} · <code>${g.id}</code></div>`;
           gamesEl.appendChild(li);
         }
         emptyEl.hidden = data.games.length > 0;
         const s = data.stats;
         const detectors = s.mode === "both" ? "polling + stream" : s.mode === "poll" ? "polling" : "stream";
+        const rule = `${(s.timeControls || []).join("/")} · ${s.ratingRule === "either" ? "one" : "both"} under ${s.ratingCap}`;
         statsEl.className = "stats";
         statsEl.textContent =
-          `${s.poolSize} players in the pool · ${detectors} · ${s.accepted} games found, ${s.rejected} rejected` +
-          (s.discoveredPending ? ` · ${s.discoveredPending} opponents waiting for the next pool refresh` : "") +
+          `${s.poolSize} players in the pool` +
+          (s.hotPlayers != null ? ` (${s.hotPlayers} online)` : "") +
+          (s.building ? " · building the pool…" : "") +
+          ` · ${rule} · ${detectors} · ${s.accepted} games found, ${s.rejected} rejected` +
+          (s.rateLimitHits ? ` · ${s.rateLimitHits} rate-limit pauses` : "") +
+          (s.discoveredPending ? ` · ${s.discoveredPending} opponents waiting for the next refresh` : "") +
           ` · refreshes every ${REFRESH_MS / 1000}s`;
       }
 

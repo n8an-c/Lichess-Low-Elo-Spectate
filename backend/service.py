@@ -1,4 +1,4 @@
-"""Orchestrates the pool refresher, the detectors and the verifier in one process."""
+"""Orchestrates the pool builders, the detectors and the verifier in one process."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ from collections import deque
 from collections.abc import Callable
 
 from .config import Settings
-from .db import Database
+from .db import Database, now_ms
 from .gamestream import GameStreamWatcher
 from .lichess import LichessClient
 from .poller import Poller
-from .pool import build_pool
+from .pool import build_pool, confirm_members, fetch_discovered
+from .snowball import Crawler, since_days_ms
 from .verifier import Candidates, GameInfo, verify_game
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ class Spectator:
             if det.stream_enabled
             else None
         )
+        self.crawler = Crawler(self.client, self.db, settings) if settings.pool.games_enabled else None
         self.on_accept: list[AcceptCallback] = []
         self.recent: deque[GameInfo] = deque(maxlen=200)  # accepted games, newest first
         self.accepted_total = 0
@@ -46,8 +48,10 @@ class Spectator:
         self.crashes = 0
         self.restart_delay = 5.0
         self.started_at = time.time()
+        self.building = False
         self._pool_size_cache: tuple[float, int] = (0.0, 0)
         self._tasks: list[asyncio.Task] = []
+        self._verify_tasks: set[asyncio.Task] = set()
 
     # -- feed for the web page -------------------------------------------------------
 
@@ -61,22 +65,43 @@ class Spectator:
         now = time.monotonic()
         if now - at > 5:
             try:
-                size = len(self.db.active_player_ids())
+                size = self.db.active_count()
             except Exception:  # closed database at shutdown: keep the last value
                 pass
             self._pool_size_cache = (now, size)
         return size
 
     def stats(self) -> dict:
-        disc = self.db.discovered_stats() if self.db.conn else {"total": 0, "pending": 0}
+        try:
+            disc = self.db.discovered_stats()
+            activity = self.db.activity_stats()
+        except Exception:
+            disc, activity = {"total": 0, "pending": 0}, {}
+        det = self.settings.detection
+        crawl = self.crawler.last_result if self.crawler else None
         return {
-            "mode": self.settings.detection.mode,
+            "mode": det.mode,
+            "poolSource": self.settings.pool.source,
             "poolSize": self.pool_size(),
+            "activeLastDay": activity.get("last_day"),
+            "hotPlayers": len(self.poller.hot) if self.poller else None,
             "accepted": self.accepted_total,
             "rejected": self.rejected_total,
             "pollPasses": self.poller.passes if self.poller else None,
+            "sweepSeconds": round(self.poller.last_sweep_seconds) if self.poller else None,
+            "requestsPerMinute": self.client.requests_per_minute(),
+            "rateLimitHits": self.client.rate_limit_hits,
             "streams": self.watcher.streams if self.watcher else None,
             "discoveredPending": disc["pending"],
+            "building": self.building,
+            "lastCrawl": None if crawl is None else {
+                "requests": crawl.requests, "added": crawl.added, "dropped": crawl.dropped,
+                "seconds": round(crawl.seconds), "stopped": crawl.stopped,
+            },
+            "timeControls": det.time_controls,
+            "ratingRule": det.rating_rule,
+            "ratingCap": self.settings.pool.rating_cap,
+            "maxStartPlies": det.max_start_plies,
             "uptimeSeconds": round(time.time() - self.started_at),
         }
 
@@ -96,7 +121,7 @@ class Spectator:
         self.discovered_total += 1
         log.debug("discovered opponent %s (%d)", player_id, rating)
 
-    # -- background loops --------------------------------------------------------
+    # -- pool loops --------------------------------------------------------------------
 
     def pool_is_fresh(self) -> bool:
         last = self.db.pool_last_updated()
@@ -105,47 +130,144 @@ class Spectator:
         age_hours = (time.time() * 1000 - last) / 3_600_000
         return age_hours < self.settings.pool.pool_refresh_hours
 
+    async def build_or_top_up(self) -> None:
+        """Teams scan (if enabled and stale) and/or snowball crawl up to the member target."""
+        pool = self.settings.pool
+        self.building = True
+        try:
+            if pool.teams_enabled and not self.pool_is_fresh():
+                log.info("team scan: pool is empty or stale; scanning teams (detection continues meanwhile)")
+                result = await build_pool(self.client, self.db, pool)
+                log.info("team scan done: %d active players", result.qualifying)
+            if self.crawler is not None:
+                active = self.db.active_count()
+                if active < pool.max_members:
+                    log.info("pool has %d members (target %d); crawling rated games for more", active, pool.max_members)
+                    now = now_ms()
+                    result = await self.crawler.crawl(
+                        request_budget=pool.crawl_request_budget,
+                        since_ms=since_days_ms(now, pool.games_since_days),
+                        target_members=pool.max_members,
+                        now_ms=now,
+                    )
+                    log.info("crawl done: %d active players", self.db.active_count())
+                else:
+                    log.info("pool has %d members (target %d); no crawl needed", active, pool.max_members)
+            self.pool_refreshed.set()  # the games-by-users watcher rebuilds its streams
+        except Exception:  # keep the service alive; try again next cycle
+            log.exception("pool build failed")
+        finally:
+            self.building = False
+
     async def pool_loop(self) -> None:
         refresh_seconds = self.settings.pool.pool_refresh_hours * 3600
         while True:
             if self.skip_pool_build and self.db.pool_last_updated() is None:
                 log.warning("--skip-pool-build given but the pool is empty; run build-pool first")
-            elif self.pool_is_fresh() or self.skip_pool_build:
-                log.info("player pool is fresh (%d active players); next refresh in %.1fh",
-                         len(self.db.active_player_ids()), self.settings.pool.pool_refresh_hours)
+            elif self.skip_pool_build:
+                log.info("--skip-pool-build: keeping the %d active players as they are", self.db.active_count())
             else:
-                log.info("player pool is empty or stale; building it now (detection continues meanwhile)")
-                try:
-                    result = await build_pool(self.client, self.db, self.settings.pool)
-                    log.info("pool refresh done: %d active players", result.qualifying)
-                    self.pool_refreshed.set()  # the games-by-users watcher rebuilds its streams
-                except Exception:  # keep the service alive; try again next cycle
-                    log.exception("pool build failed")
+                await self.build_or_top_up()
             await asyncio.sleep(refresh_seconds)
             self.skip_pool_build = False
 
+    async def trickle_loop(self) -> None:
+        """Every few minutes re-read the latest games of the most active members for fresh opponents."""
+        pool = self.settings.pool
+        while True:
+            await asyncio.sleep(pool.trickle_interval_minutes * 60)
+            if self.crawler is None or self.building:
+                continue
+            try:
+                if self.db.active_count() >= pool.max_members * 1.25:
+                    continue  # expiry will trim the pool first
+                parents = self.db.most_active_members(pool.trickle_players)
+                if self.poller is not None:
+                    for pid in sorted(self.poller.hot, key=self.poller.hot.get, reverse=True):
+                        if len(parents) >= pool.trickle_players * 2:
+                            break
+                        if pid not in parents:
+                            parents.append(pid)
+                if not parents:
+                    continue
+                now = now_ms()
+                result = await self.crawler.crawl(
+                    request_budget=len(parents),
+                    since_ms=int(now - pool.trickle_hours * 3_600_000),
+                    parents=parents,
+                    expand=False,
+                    now_ms=now,
+                )
+                if result.added:
+                    log.info("trickle: %d new members from %d players' latest games", result.added, result.players_expanded)
+                    self.pool_refreshed.set()
+            except Exception:
+                log.exception("trickle crawl failed")
+
+    async def refresh_loop(self) -> None:
+        """Light refresh: re-check stale profiles, look up discovered opponents, expire inactive members."""
+        pool = self.settings.pool
+        while True:
+            await asyncio.sleep(pool.light_refresh_minutes * 60)
+            if self.building:
+                continue
+            try:
+                now = now_ms()
+                changed = False
+                budget = pool.max_profile_refresh_batches
+                stale = self.db.members_to_recheck(now - int(pool.profile_recheck_hours * 3_600_000), limit=budget * 300)
+                if stale:
+                    summary = await confirm_members(self.client, self.db, pool, stale, now_ms=now, max_batches=budget)
+                    budget -= summary.requests
+                    log.info("profile refresh: %d checked, %d kept, %d dropped", summary.checked, summary.kept, summary.dropped)
+                    changed = changed or summary.dropped > 0
+                if budget > 0:
+                    fetched, added, waiting = await fetch_discovered(self.client, self.db, pool, now, budget)
+                    if fetched:
+                        log.info("discovered opponents: %d looked up, %d added, %d waiting", fetched, added, waiting)
+                        changed = changed or added > 0
+                if pool.games_enabled:
+                    expired = self.db.expire_inactive_members(since_days_ms(now, pool.games_since_days), updated_at=now)
+                    if expired:
+                        log.info("expired %d members with no game in %d days", expired, pool.games_since_days)
+                        changed = True
+                if changed:
+                    self.pool_refreshed.set()
+            except Exception:
+                log.exception("light refresh failed")
+
+    # -- verification ------------------------------------------------------------------
+
     async def verifier_loop(self) -> None:
+        sem = asyncio.Semaphore(self.settings.detection.verify_concurrency)
         while True:
             game_id = await self.queue.get()
-            try:
-                verdict = await verify_game(self.client, game_id, self.settings, discover=self.discover)
-                self.db.record_game(game_id, verdict.accepted)
-                if verdict.accepted and verdict.game is not None:
-                    self.record_accepted(verdict.game)
-                    log.info("ACCEPTED %s  %s", verdict.game.describe(), verdict.game.url)
-                    for cb in self.on_accept:
-                        try:
-                            cb(verdict.game)
-                        except Exception:
-                            log.exception("on_accept callback failed")
-                else:
-                    self.rejected_total += 1
-                    log.info("rejected %s: %s", game_id, verdict.reason)
-            except Exception:
-                log.exception("verification of %s crashed", game_id)
-            finally:
-                self.pending.discard(game_id)
-                self.queue.task_done()
+            await sem.acquire()
+            task = asyncio.create_task(self._verify_one(game_id, sem), name=f"verify-{game_id}")
+            self._verify_tasks.add(task)
+            task.add_done_callback(self._verify_tasks.discard)
+
+    async def _verify_one(self, game_id: str, sem: asyncio.Semaphore) -> None:
+        try:
+            verdict = await verify_game(self.client, game_id, self.settings, discover=self.discover)
+            self.db.record_game(game_id, verdict.accepted)
+            if verdict.accepted and verdict.game is not None:
+                self.record_accepted(verdict.game)
+                log.info("ACCEPTED %s  %s", verdict.game.describe(), verdict.game.url)
+                for cb in self.on_accept:
+                    try:
+                        cb(verdict.game)
+                    except Exception:
+                        log.exception("on_accept callback failed")
+            else:
+                self.rejected_total += 1
+                log.info("rejected %s: %s", game_id, verdict.reason)
+        except Exception:
+            log.exception("verification of %s crashed", game_id)
+        finally:
+            self.pending.discard(game_id)
+            self.queue.task_done()
+            sem.release()
 
     async def expiry_loop(self) -> None:
         while True:
@@ -164,6 +286,9 @@ class Spectator:
             loops["gamestream"] = self.watcher.run
         loops["verifier"] = self.verifier_loop
         loops["expiry"] = self.expiry_loop
+        if self.crawler is not None:
+            loops["trickle"] = self.trickle_loop
+        loops["refresh"] = self.refresh_loop
         return loops
 
     async def _supervise(self, name: str, factory, restart_delay: float = 5.0) -> None:
@@ -181,7 +306,11 @@ class Spectator:
 
     async def run(self) -> None:
         """Run all loops until cancelled. A crashing loop is restarted, never fatal."""
-        log.info("detection mode: %s", self.settings.detection.mode)
+        det = self.settings.detection
+        log.info(
+            "detection mode: %s; pool source: %s; time controls: %s; rating rule: %s under %d; max start plies: %d",
+            det.mode, self.settings.pool.source, det.label, det.rating_rule, self.settings.pool.rating_cap, det.max_start_plies,
+        )
         self._tasks = [
             asyncio.create_task(self._supervise(name, factory, self.restart_delay), name=name)
             for name, factory in self.loops().items()
@@ -192,9 +321,9 @@ class Spectator:
             await self.stop()
 
     async def stop(self) -> None:
-        for task in self._tasks:
+        for task in [*self._tasks, *self._verify_tasks]:
             task.cancel()
-        for task in self._tasks:
+        for task in [*self._tasks, *self._verify_tasks]:
             try:
                 await task
             except (asyncio.CancelledError, Exception):

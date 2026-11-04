@@ -75,6 +75,45 @@ def test_check_header_accepts():
     assert v.game.white.name == "Alice" and v.game.black.rating == 947
 
 
+def test_check_header_rejects_bots_and_provisional_ratings():
+    bot = {"white": {"user": {"name": "maia1", "id": "maia1", "title": "BOT"}, "rating": 900},
+           "black": {"user": {"name": "B", "id": "b"}, "rating": 500}}
+    assert check_header(header(players=bot), SETTINGS, NOW).reason == "maia1 is a bot"
+    prov = {"white": {"user": {"name": "A", "id": "a"}, "rating": 900, "provisional": True},
+            "black": {"user": {"name": "B", "id": "b"}, "rating": 500}}
+    assert check_header(header(players=prov), SETTINGS, NOW).reason == "A has a provisional rating"
+
+
+def test_rating_rule_either_and_time_control_list():
+    either = Settings(pool=PoolSettings(rating_cap=1000),
+                      detection=DetectionSettings(rating_rule="either", time_controls=["3+0", "5+3"]))
+    mixed = {"white": {"user": {"name": "A", "id": "a"}, "rating": 1300},
+             "black": {"user": {"name": "B", "id": "b"}, "rating": 700}}
+    assert check_header(header(players=mixed), SETTINGS, NOW).reason == "A rated 1300 >= 1000"
+    assert check_header(header(players=mixed), either, NOW).accepted
+    strong = {"white": {"user": {"name": "A", "id": "a"}, "rating": 1300},
+              "black": {"user": {"name": "B", "id": "b"}, "rating": 1000}}
+    assert check_header(header(players=strong), either, NOW).reason == "neither player under 1000 (1300 / 1000)"
+    assert either.detection.clock_pairs() == {(180, 0), (300, 3)}
+    assert either.detection.speeds() == {"blitz"}  # 5+3 is blitz too (300 + 40*3 = 420 s < 480)
+    rapid = Settings(detection=DetectionSettings(time_controls=["10+0"]))
+    assert rapid.detection.speeds() == {"rapid"}
+    assert check_header(header(), rapid, NOW).reason == "speed blitz"
+
+
+async def test_verify_accepts_any_configured_initial_clock():
+    settings = Settings(pool=PoolSettings(rating_cap=1000),
+                        detection=DetectionSettings(time_controls=["3+0", "5+0"], replay_idle_seconds=0.05,
+                                                    stream_open_timeout_seconds=1.0, max_start_plies=10))
+    lines = move_lines(2)
+    lines[0] = {"fen": START, "wc": 300, "bc": 300}
+    transport = live_transport(header(), lines)
+    async with LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=transport) as client:
+        v = await verify_game(client, "abcd1234", settings, now_ms=NOW)
+    assert v.accepted, v.reason
+    assert v.game.estimated_plies == 5 and v.game.to_dict()["estimatedPlies"] == 5
+
+
 def move_lines(n):
     """Initial position followed by n move lines with FENs reflecting the ply count."""
     lines = [{"fen": START, "wc": 180, "bc": 180}]
@@ -131,7 +170,7 @@ async def test_verify_rejects_wrong_initial_clock():
     lines[0] = {"fen": START, "wc": 300, "bc": 300}
     v = await run_verify(live_transport(header(), lines))
     assert not v.accepted
-    assert v.reason == "initial clock 300+300s is not 180s"
+    assert v.reason == "initial clock 300+300s is not one of [180]s"
 
 
 async def test_verify_rejects_header_without_reading_moves():

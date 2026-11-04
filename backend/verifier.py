@@ -1,6 +1,6 @@
 """Game verification and the in-memory candidate list.
 
-A game ID found by the poller is verified by opening its stream and reading
+A game ID found by a detector is verified by opening its stream and reading
 the first messages. Facts about ``GET /api/stream/game/{id}`` (checked live):
 
 - Line 1 describes the game: id, variant, speed, perf, rated, createdAt and
@@ -9,7 +9,8 @@ the first messages. Facts about ``GET /api/stream/game/{id}`` (checked live):
 - The stream then replays the game from the initial position, one
   ``{fen, lm, wc, bc}`` line per move, in a quick burst, before going live.
   The current ply count is therefore read from the last FEN of that burst.
-- Ongoing games are delayed by 3 moves on Lichess's side.
+- Ongoing games are delayed by 3 moves on Lichess's side, so the replayed
+  ply count is about ``STREAM_DELAY_PLIES`` behind the real game.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ from .config import Settings
 from .lichess import LichessClient, LichessError, LichessHTTPError
 
 log = logging.getLogger(__name__)
+
+STREAM_DELAY_PLIES = 3  # Lichess delays spectator streams by 3 moves (plies, in practice)
 
 
 def plies_from_fen(fen: str) -> int:
@@ -41,6 +44,7 @@ class PlayerInfo:
     name: str
     rating: int
     title: str | None = None
+    provisional: bool = False
 
 
 @dataclass
@@ -49,14 +53,20 @@ class GameInfo:
     white: PlayerInfo
     black: PlayerInfo
     created_at: int  # epoch ms
-    plies_at_join: int
+    plies_at_join: int  # plies in the (delayed) stream when verified
     detected_at: float = field(default_factory=time.monotonic)
     found_at: float = field(default_factory=time.time)  # epoch seconds, for display
     fen: str | None = None
+    clock: str | None = None  # e.g. "3+0" when known
 
     @property
     def url(self) -> str:
         return f"https://lichess.org/{self.id}"
+
+    @property
+    def estimated_plies(self) -> int:
+        """Best guess of the real ply count at verification (stream delay added)."""
+        return self.plies_at_join + STREAM_DELAY_PLIES if self.plies_at_join > 0 else 0
 
     def to_dict(self, now: float | None = None) -> dict:
         now = time.time() if now is None else now
@@ -66,6 +76,8 @@ class GameInfo:
             "white": self.white.__dict__,
             "black": self.black.__dict__,
             "pliesAtJoin": self.plies_at_join,
+            "estimatedPlies": self.estimated_plies,
+            "clock": self.clock,
             "createdAt": self.created_at,
             "foundAt": self.found_at,
             "ageSeconds": round(now - self.created_at / 1000) if self.created_at else None,
@@ -89,7 +101,13 @@ def _player(side: dict) -> PlayerInfo | None:
     user = side.get("user") or {}
     if "rating" not in side or "id" not in user:
         return None  # anonymous or AI player
-    return PlayerInfo(id=user["id"], name=user.get("name", user["id"]), rating=int(side["rating"]), title=user.get("title"))
+    return PlayerInfo(
+        id=user["id"],
+        name=user.get("name", user["id"]),
+        rating=int(side["rating"]),
+        title=user.get("title"),
+        provisional=bool(side.get("provisional")),
+    )
 
 
 def header_players(head: dict) -> tuple[PlayerInfo | None, PlayerInfo | None]:
@@ -98,41 +116,65 @@ def header_players(head: dict) -> tuple[PlayerInfo | None, PlayerInfo | None]:
     return _player(players.get("white") or {}), _player(players.get("black") or {})
 
 
+def is_rated_standard(head: dict, speeds: set[str] | None = None) -> bool:
+    """True when the header's ratings are standard-chess ratings of an allowed speed."""
+    if not head.get("rated") or (head.get("variant") or {}).get("key") != "standard":
+        return False
+    return speeds is None or head.get("speed") in speeds
+
+
 def is_rated_standard_blitz(head: dict) -> bool:
-    """True when the header's ratings are blitz ratings worth learning from."""
-    return bool(head.get("rated")) and (head.get("variant") or {}).get("key") == "standard" and head.get("speed") == "blitz"
+    return is_rated_standard(head, {"blitz"})
 
 
 DiscoverCallback = Callable[[str, int], None]  # (player id, rating in this game)
 
 
+def rating_rule_reason(white: PlayerInfo, black: PlayerInfo, cap: int, rule: str) -> str | None:
+    """Why the pair fails the rating rule, or None if it passes."""
+    under = [p for p in (white, black) if p.rating < cap]
+    if rule == "either":
+        if not under:
+            return f"neither player under {cap} ({white.rating} / {black.rating})"
+        return None
+    for p in (white, black):
+        if p.rating >= cap:
+            return f"{p.name} rated {p.rating} >= {cap}"
+    return None
+
+
 def check_header(head: dict, settings: Settings, now_ms: int, *, check_age: bool = True) -> Verdict:
     """Apply every check that can be made from the stream's first line.
 
-    ``check_age=False`` skips the "started recently" rule; the viewer uses
-    that when re-checking a candidate at pick time, where the ply count is
-    the late-join criterion.
+    ``check_age=False`` skips the "started recently" rule (the caller applies
+    it after the replay, so a game still at ply 0 is never "too old").
     """
+    det = settings.detection
     if not head.get("rated"):
         return Verdict(False, "not rated")
     variant = (head.get("variant") or {}).get("key")
     if variant != "standard":
         return Verdict(False, f"variant {variant}")
-    if head.get("speed") != "blitz":
+    speeds = det.speeds()
+    if head.get("speed") not in speeds:
         return Verdict(False, f"speed {head.get('speed')}")
     players = head.get("players") or {}
     white, black = header_players(head)
     if white is None or black is None:
         return Verdict(False, "anonymous or computer player")
-    cap = settings.pool.rating_cap
     for p in (white, black):
-        if p.rating >= cap:
-            return Verdict(False, f"{p.name} rated {p.rating} >= {cap}")
+        if p.title == "BOT":
+            return Verdict(False, f"{p.name} is a bot")
+        if p.provisional:
+            return Verdict(False, f"{p.name} has a provisional rating")
+    reason = rating_rule_reason(white, black, settings.pool.rating_cap, det.rating_rule)
+    if reason is not None:
+        return Verdict(False, reason)
     if "ratingDiff" in players["white"] or "ratingDiff" in players["black"]:
         return Verdict(False, "already finished")
     created_at = int(head.get("createdAt") or 0)
     age = (now_ms - created_at) / 1000 if created_at else None
-    if check_age and age is not None and age > settings.detection.max_game_age_seconds:
+    if check_age and age is not None and age > det.max_game_age_seconds:
         return Verdict(False, f"started {age:.0f}s ago")
     game = GameInfo(id=head["id"], white=white, black=black, created_at=created_at, plies_at_join=0)
     return Verdict(True, "header ok", game)
@@ -156,8 +198,7 @@ class StreamReader:
 
     ``asyncio.wait_for`` on ``anext(stream)`` would cancel (and so destroy)
     the underlying generator on timeout; waiting on a queue instead keeps the
-    stream alive, which the viewer needs to detect the end of the replay
-    burst and then keep following the game.
+    stream alive.
     """
 
     def __init__(self, stream):
@@ -221,6 +262,7 @@ async def read_replay(reader: StreamReader, det, *, max_plies: int | None = None
     """
     last: dict | None = None
     first_clock_checked = False
+    allowed_initials = det.initial_seconds()
     while True:
         line = await reader.next(det.replay_idle_seconds)
         if line is None:
@@ -233,9 +275,11 @@ async def read_replay(reader: StreamReader, det, *, max_plies: int | None = None
         last_fen = line["fen"]
         if not first_clock_checked and "wc" in line and "bc" in line:
             first_clock_checked = True
-            expected = _initial_seconds(det.time_control)
-            if expected is not None and "lm" not in line and (line["wc"] != expected or line["bc"] != expected):
-                raise ValueError(f"initial clock {line['wc']}+{line['bc']}s is not {expected}s")
+            if "lm" not in line and (line["wc"] != line["bc"] or line["wc"] not in allowed_initials):
+                raise ValueError(
+                    f"initial clock {line['wc']}+{line['bc']}s is not one of "
+                    f"{sorted(allowed_initials)}s"
+                )
         if max_plies is not None:
             plies = plies_from_fen(last_fen)
             if plies > max_plies:
@@ -270,8 +314,8 @@ async def verify_game(
     """Open the game stream, check the header, then count the replayed plies.
 
     ``discover`` is called with (player id, rating) for both players of every
-    rated standard blitz header, accepted or not, so opponents can be
-    recorded as pool candidates.
+    rated standard header of an allowed speed, accepted or not, so opponents
+    can be recorded as pool candidates.
     """
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     det = settings.detection
@@ -286,9 +330,9 @@ async def verify_game(
     except LichessError as exc:
         return Verdict(False, str(exc))
     try:
-        if discover is not None and is_rated_standard_blitz(head):
+        if discover is not None and is_rated_standard(head, det.speeds()):
             for p in header_players(head):
-                if p is not None:
+                if p is not None and p.title != "BOT" and not p.provisional:
                     try:
                         discover(p.id, p.rating)
                     except Exception:

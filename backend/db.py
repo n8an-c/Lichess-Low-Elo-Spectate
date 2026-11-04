@@ -48,6 +48,14 @@ CREATE TABLE IF NOT EXISTS discovered_players (
 
 DAY_MS = 86_400_000
 
+# Columns added after the first release; created on the fly for older databases.
+PLAYER_COLUMNS = {
+    "last_game_at": "INTEGER",  # epoch ms of the newest matching rated game seen (games source)
+    "game_rating": "INTEGER",  # the player's rating in that game
+    "games_recent": "INTEGER",  # matching games seen in the crawl window
+    "expanded_at": "INTEGER",  # when the crawler last fetched this player's games
+}
+
 
 @dataclass(frozen=True)
 class PlayerRow:
@@ -57,6 +65,9 @@ class PlayerRow:
     provisional: bool
     seen_at: int  # epoch milliseconds, as Lichess reports it
     source_team: str | None = None
+    last_game_at: int | None = None
+    game_rating: int | None = None
+    games_recent: int | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +89,14 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(players)")}
+        with self.conn:
+            for column, kind in PLAYER_COLUMNS.items():
+                if column not in existing:
+                    self.conn.execute(f"ALTER TABLE players ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         self.conn.close()
@@ -117,16 +136,27 @@ class Database:
             self.conn.executemany(
                 """
                 INSERT INTO players
-                    (id, username, blitz_rating, provisional, seen_at, active, updated_at, source_team)
-                VALUES (:id, :username, :blitz_rating, :provisional, :seen_at, 1, :updated_at, :source_team)
+                    (id, username, blitz_rating, provisional, seen_at, active, updated_at, source_team,
+                     last_game_at, game_rating, games_recent)
+                VALUES (:id, :username, :blitz_rating, :provisional, :seen_at, 1, :updated_at, :source_team,
+                        :last_game_at, :game_rating, :games_recent)
                 ON CONFLICT(id) DO UPDATE SET
                     username = excluded.username,
                     blitz_rating = excluded.blitz_rating,
                     provisional = excluded.provisional,
-                    seen_at = excluded.seen_at,
+                    seen_at = MAX(excluded.seen_at, COALESCE(players.seen_at, 0)),
                     active = 1,
                     updated_at = excluded.updated_at,
-                    source_team = COALESCE(excluded.source_team, players.source_team)
+                    source_team = COALESCE(excluded.source_team, players.source_team),
+                    game_rating = CASE
+                        WHEN excluded.last_game_at IS NOT NULL
+                             AND excluded.last_game_at >= COALESCE(players.last_game_at, 0)
+                        THEN excluded.game_rating ELSE COALESCE(players.game_rating, excluded.game_rating) END,
+                    last_game_at = CASE
+                        WHEN excluded.last_game_at IS NULL THEN players.last_game_at
+                        WHEN players.last_game_at IS NULL THEN excluded.last_game_at
+                        ELSE MAX(excluded.last_game_at, players.last_game_at) END,
+                    games_recent = COALESCE(excluded.games_recent, players.games_recent)
                 """,
                 [
                     {
@@ -137,10 +167,111 @@ class Database:
                         "seen_at": r.seen_at,
                         "updated_at": ts,
                         "source_team": r.source_team,
+                        "last_game_at": r.last_game_at,
+                        "game_rating": r.game_rating,
+                        "games_recent": r.games_recent,
                     }
                     for r in rows
                 ],
             )
+
+    def update_player_activity(
+        self,
+        player_id: str,
+        *,
+        last_game_at: int | None = None,
+        game_rating: int | None = None,
+        games_recent: int | None = None,
+        expanded_at: int | None = None,
+    ) -> None:
+        """Record what a games export told us about a player (newest game wins)."""
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE players SET
+                    game_rating = CASE
+                        WHEN :last_game_at IS NOT NULL AND :last_game_at >= COALESCE(last_game_at, 0)
+                             AND :game_rating IS NOT NULL
+                        THEN :game_rating ELSE game_rating END,
+                    last_game_at = CASE
+                        WHEN :last_game_at IS NOT NULL AND :last_game_at > COALESCE(last_game_at, 0)
+                        THEN :last_game_at ELSE last_game_at END,
+                    games_recent = COALESCE(:games_recent, games_recent),
+                    expanded_at = COALESCE(:expanded_at, expanded_at)
+                WHERE id = :id
+                """,
+                {"id": player_id, "last_game_at": last_game_at, "game_rating": game_rating,
+                 "games_recent": games_recent, "expanded_at": expanded_at},
+            )
+
+    def mark_expanded(self, ids: Iterable[str], when_ms: int | None = None) -> None:
+        ts = when_ms or now_ms()
+        with self.conn:
+            self.conn.executemany("UPDATE players SET expanded_at = ? WHERE id = ?", [(ts, i) for i in ids])
+
+    def crawl_frontier(self, limit: int, *, prefer_rating_max: int = 950, not_expanded_since: int | None = None) -> list[str]:
+        """Active members worth expanding: never expanded first, then low-rated, then recently active."""
+        cutoff = not_expanded_since if not_expanded_since is not None else now_ms()
+        cur = self.conn.execute(
+            """
+            SELECT id FROM players
+            WHERE active = 1 AND (expanded_at IS NULL OR expanded_at < ?)
+            ORDER BY (expanded_at IS NOT NULL), (COALESCE(game_rating, 10000) > ?), (last_game_at IS NULL),
+                     last_game_at DESC, id
+            LIMIT ?
+            """,
+            (cutoff, prefer_rating_max, int(limit)),
+        )
+        return [row["id"] for row in cur]
+
+    def most_active_members(self, limit: int) -> list[str]:
+        cur = self.conn.execute(
+            """
+            SELECT id FROM players WHERE active = 1 AND last_game_at IS NOT NULL
+            ORDER BY last_game_at DESC, COALESCE(games_recent, 0) DESC LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [row["id"] for row in cur]
+
+    def members_to_recheck(self, older_than_ms: int, limit: int) -> list[str]:
+        cur = self.conn.execute(
+            "SELECT id FROM players WHERE active = 1 AND updated_at < ? ORDER BY updated_at ASC LIMIT ?",
+            (older_than_ms, int(limit)),
+        )
+        return [row["id"] for row in cur]
+
+    def expire_inactive_members(self, cutoff_ms: int, updated_at: int | None = None) -> int:
+        """Deactivate members whose newest known game is older than the cutoff."""
+        ts = updated_at or now_ms()
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE players SET active = 0, updated_at = ? WHERE active = 1 AND last_game_at IS NOT NULL AND last_game_at < ?",
+                (ts, cutoff_ms),
+            )
+            return cur.rowcount if cur.rowcount >= 0 else 0
+
+    def active_count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM players WHERE active = 1").fetchone()[0]
+
+    def activity_stats(self) -> dict:
+        now = now_ms()
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS active,
+                   SUM(last_game_at >= ?) AS last_day,
+                   SUM(last_game_at >= ?) AS last_week,
+                   SUM(last_game_at IS NOT NULL) AS with_games
+            FROM players WHERE active = 1
+            """,
+            (now - DAY_MS, now - 7 * DAY_MS),
+        ).fetchone()
+        return {
+            "active": row["active"] or 0,
+            "last_day": row["last_day"] or 0,
+            "last_week": row["last_week"] or 0,
+            "with_games": row["with_games"] or 0,
+        }
 
     def deactivate_players(self, ids: Iterable[str], updated_at: int | None = None) -> int:
         ts = updated_at or now_ms()
@@ -154,6 +285,12 @@ class Database:
             )
             return cur.rowcount if cur.rowcount >= 0 else 0
 
+    def touch_players(self, ids: Iterable[str], updated_at: int | None = None) -> None:
+        """Mark players as checked now without changing anything else."""
+        ts = updated_at or now_ms()
+        with self.conn:
+            self.conn.executemany("UPDATE players SET updated_at = ? WHERE id = ?", [(ts, i) for i in ids])
+
     def active_player_ids(self) -> list[str]:
         cur = self.conn.execute("SELECT id FROM players WHERE active = 1 ORDER BY id")
         return [row["id"] for row in cur]
@@ -166,7 +303,7 @@ class Database:
         return {row["id"] for row in self.conn.execute("SELECT id FROM players")}
 
     def active_players(self, limit: int | None = None) -> list[sqlite3.Row]:
-        sql = "SELECT * FROM players WHERE active = 1 ORDER BY seen_at DESC"
+        sql = "SELECT * FROM players WHERE active = 1 ORDER BY COALESCE(last_game_at, seen_at) DESC"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         return list(self.conn.execute(sql))

@@ -1,10 +1,13 @@
 """Rate-limited async Lichess API client.
 
 Rules (from https://lichess.org/api, "Rate limiting"):
-- Only make one request at a time. A single asyncio.Lock serialises every
-  request and every open NDJSON stream, which acts as the global queue.
-- On HTTP 429, pause *all* requests for a full minute, then retry once.
-- Wait a small courtesy delay after each request.
+- Only make one request at a time. A single asyncio.Lock serialises the
+  opening of every request and every NDJSON stream (the global queue).
+- Consecutive requests are spaced by ``courtesy_delay_seconds``; the spacing
+  is enforced before a request starts, so it costs nothing when the caller
+  had other work to do in between.
+- On HTTP 429, pause *all* requests (for ``Retry-After`` or a full minute,
+  whichever is longer), then retry once.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -55,6 +59,8 @@ class LichessClient:
         self._http = httpx.AsyncClient(base_url=BASE_URL, headers=headers, timeout=30.0, transport=transport)
         self._lock = asyncio.Lock()
         self._pause_until = 0.0
+        self._next_allowed_at = 0.0
+        self._recent: deque[float] = deque(maxlen=600)  # monotonic send times, for the stats line
         self.rate_limit_hits = 0
         self.request_count = 0
 
@@ -67,24 +73,36 @@ class LichessClient:
     async def __aexit__(self, *exc) -> None:
         await self.aclose()
 
-    # -- queue / pause mechanics -------------------------------------------------
+    # -- queue / pause / spacing mechanics -----------------------------------------
 
-    async def _wait_if_paused(self) -> None:
+    def requests_per_minute(self) -> float:
+        cutoff = time.monotonic() - 60
+        return float(sum(1 for t in self._recent if t >= cutoff))
+
+    async def _wait_for_slot(self) -> None:
         remaining = self._pause_until - time.monotonic()
         if remaining > 0:
             log.warning("Rate-limit pause: waiting %.0fs before the next Lichess request", remaining)
             await asyncio.sleep(remaining)
+        spacing = self._next_allowed_at - time.monotonic()
+        if spacing > 0:
+            await asyncio.sleep(spacing)
 
-    def _enter_pause(self) -> None:
+    def _mark_sent(self) -> None:
+        now = time.monotonic()
+        self._next_allowed_at = now + self.settings.courtesy_delay_seconds
+        self._recent.append(now)
+
+    def _enter_pause(self, retry_after: str | None = None) -> None:
         self.rate_limit_hits += 1
-        self._pause_until = time.monotonic() + self.settings.rate_limit_pause_seconds
-        log.warning(
-            "Lichess returned 429; pausing all requests for %.0fs", self.settings.rate_limit_pause_seconds
-        )
-
-    async def _courtesy_delay(self) -> None:
-        if self.settings.courtesy_delay_seconds > 0:
-            await asyncio.sleep(self.settings.courtesy_delay_seconds)
+        seconds = self.settings.rate_limit_pause_seconds
+        if retry_after:
+            try:
+                seconds = max(seconds, float(retry_after))
+            except ValueError:
+                pass
+        self._pause_until = time.monotonic() + seconds
+        log.warning("Lichess returned 429; pausing all requests for %.0fs", seconds)
 
     async def _send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
         """Send one request under the global lock, handling 429 with one retry.
@@ -92,17 +110,20 @@ class LichessClient:
         The caller must already hold ``self._lock``.
         """
         for attempt in (1, 2):
-            await self._wait_if_paused()
+            await self._wait_for_slot()
             self.request_count += 1
             log.debug("Lichess %s %s (attempt %d)", request.method, request.url, attempt)
             try:
                 response = await self._http.send(request, stream=stream)
             except httpx.HTTPError as exc:  # timeouts, connection errors, protocol errors
+                self._mark_sent()
                 raise LichessTransportError(f"{type(exc).__name__}: {exc or request.url}") from exc
+            self._mark_sent()
             if response.status_code != 429:
                 return response
+            retry_after = response.headers.get("Retry-After")
             await response.aclose()
-            self._enter_pause()
+            self._enter_pause(retry_after)
         raise LichessRateLimited(f"still rate limited after pause: {request.method} {request.url}")
 
     # -- generic request helpers -------------------------------------------------
@@ -121,13 +142,10 @@ class LichessClient:
             headers["Content-Type"] = content_type
         request = self._http.build_request(method, path, params=params, content=content, headers=headers)
         async with self._lock:
-            try:
-                response = await self._send(request)
-                if response.status_code >= 400:
-                    raise LichessHTTPError(response)
-                return response.json()
-            finally:
-                await self._courtesy_delay()
+            response = await self._send(request)
+        if response.status_code >= 400:
+            raise LichessHTTPError(response)
+        return response.json()
 
     async def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return await self.request_json("GET", path, params=params)
@@ -146,11 +164,11 @@ class LichessClient:
     ) -> AsyncIterator[dict]:
         """Yield one parsed JSON object per NDJSON line.
 
-        The global lock is held only until the response headers arrive (plus
-        the courtesy delay); the body is then read with the lock released so
-        that a long-lived stream (a game, a large team) does not block the
-        poller. Lichess's "one request at a time" rule applies to opening
-        requests; open game streams have their own separate limit (8 per IP).
+        The global lock is held only until the response headers arrive; the
+        body is then read with the lock released so that a long-lived stream
+        (a game, a games export, a team roster) does not block the poller.
+        Lichess's "one request at a time" rule applies to opening requests;
+        open game streams have their own separate limit (8 per IP).
         """
         headers = {"Accept": NDJSON}
         if content_type:
@@ -165,13 +183,10 @@ class LichessClient:
         )
         async with self._lock:
             response = await self._send(request, stream=True)
-            try:
-                if response.status_code >= 400:
-                    await response.aread()
-                    await response.aclose()
-                    raise LichessHTTPError(response)
-            finally:
-                await self._courtesy_delay()
+            if response.status_code >= 400:
+                await response.aread()
+                await response.aclose()
+                raise LichessHTTPError(response)
         try:
             async for line in response.aiter_lines():
                 line = line.strip()
@@ -211,7 +226,7 @@ class LichessClient:
         return await self.post_text_json("/api/users", ",".join(ids))
 
     async def users_status(self, ids: list[str], with_game_metas: bool = True) -> list[dict]:
-        """GET /api/users/status for up to 100 IDs (used by the milestone 2 poller).
+        """GET /api/users/status for up to 100 IDs.
 
         With ``with_game_metas`` each playing user carries
         ``playing: {"id": ..., "clock": "3+0", "variant": ...}``; otherwise
@@ -224,6 +239,43 @@ class LichessClient:
         params: dict[str, Any] = {"ids": ",".join(ids)}
         params["withGameMetas" if with_game_metas else "withGameIds"] = "true"
         return await self.get_json("/api/users/status", params)
+
+    def user_games(
+        self,
+        username: str,
+        *,
+        rated: bool | None = True,
+        perf_type: str | None = "blitz",
+        max_games: int = 75,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+        moves: bool = False,
+    ) -> AsyncIterator[dict]:
+        """GET /api/games/user/{username} as NDJSON, newest first.
+
+        Each game carries ``players.{white,black}.{user.id,user.name,user.title?,rating,provisional?}``,
+        ``clock.{initial,increment}``, ``rated``, ``variant``, ``speed``,
+        ``createdAt``. Lichess throttles the stream to 20 games/s anonymously
+        (30/s with a token) and rounds ``max`` above 25 up to a multiple of 25.
+        """
+        params: dict[str, Any] = {"max": max_games, "moves": "true" if moves else "false"}
+        if rated is not None:
+            params["rated"] = "true" if rated else "false"
+        if perf_type:
+            params["perfType"] = perf_type
+        if since_ms is not None:
+            params["since"] = since_ms
+        if until_ms is not None:
+            params["until"] = until_ms
+        return self.stream_ndjson(f"/api/games/user/{username}", params)
+
+    async def current_tournaments(self) -> dict:
+        """GET /api/tournament -> {"created": [...], "started": [...], "finished": [...]}."""
+        return await self.get_json("/api/tournament")
+
+    def arena_results(self, arena_id: str, nb: int = 300) -> AsyncIterator[dict]:
+        """GET /api/tournament/{id}/results as NDJSON: {rank, score, rating, username, ...}."""
+        return self.stream_ndjson(f"/api/tournament/{arena_id}/results", {"nb": nb})
 
     def stream_games_by_users(self, ids: list[str], with_current_games: bool = True) -> AsyncIterator[dict]:
         """POST /api/stream/games-by-users: games between the listed users, as they start and finish.
@@ -243,7 +295,7 @@ class LichessClient:
         )
 
     def stream_game(self, game_id: str) -> AsyncIterator[dict]:
-        """GET /api/stream/game/{id} (used from milestone 2).
+        """GET /api/stream/game/{id}.
 
         First line: game description (no clock field; see SPEC notes).
         Following lines: ``{"fen", "lm", "wc", "bc"}``. Ongoing games are
