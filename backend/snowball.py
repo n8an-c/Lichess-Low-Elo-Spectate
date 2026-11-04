@@ -118,6 +118,7 @@ class Crawler:
         self.db = db
         self.settings = settings
         self.clock_pairs = settings.detection.clock_pairs()
+        self.perf_types = ",".join(sorted(settings.detection.speeds()))  # e.g. "blitz" or "blitz,rapid"
         self.last_result: CrawlResult | None = None
 
     # -- seeds -----------------------------------------------------------------------------
@@ -303,7 +304,9 @@ class Crawler:
             visited.add(pid)
             try:
                 async with aclosing(
-                    self.client.user_games(pid, max_games=pool.games_per_request, since_ms=since_ms)
+                    self.client.user_games(
+                        pid, perf_type=self.perf_types, max_games=pool.games_per_request, since_ms=since_ms
+                    )
                 ) as stream:
                     docs = [doc async for doc in stream]
             except LichessRateLimited:

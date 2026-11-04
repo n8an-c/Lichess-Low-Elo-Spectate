@@ -205,6 +205,30 @@ async def test_verify_age_rule_ignores_games_still_at_ply_zero():
     assert not v.accepted and v.reason == "started 500s ago"
 
 
+async def test_verify_waits_for_a_slow_first_position_line():
+    async def body():
+        yield (json.dumps(header()) + "\n").encode()
+        await asyncio.sleep(0.2)  # longer than replay_idle_seconds (0.05), shorter than the open timeout (1.0)
+        for obj in move_lines(2):
+            yield (json.dumps(obj) + "\n").encode()
+        await asyncio.sleep(5)
+
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, content=body()))
+    v = await run_verify(transport)
+    assert v.accepted, v.reason
+    assert v.game.plies_at_join == 2
+
+
+async def test_transient_failures_are_marked_for_retry():
+    def handler(request):
+        raise httpx.ConnectError("boom", request=request)
+
+    v = await run_verify(httpx.MockTransport(handler))
+    assert not v.accepted and v.transient
+    v = await run_verify(live_transport(header(rated=False), move_lines(2)))
+    assert not v.accepted and not v.transient  # a real rejection is final
+
+
 async def test_verify_handles_404():
     v = await run_verify(live_transport(header(), []), game_id="missing1")
     assert not v.accepted

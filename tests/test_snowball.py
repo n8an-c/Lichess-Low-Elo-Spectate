@@ -81,7 +81,7 @@ class FakeLichess:
             self.requests.append((request.method, path, dict(request.url.params), request.content.decode()))
             if path.startswith("/api/games/user/"):
                 user = path.rsplit("/", 1)[-1]
-                assert request.url.params["rated"] == "true" and request.url.params["perfType"] == "blitz"
+                assert request.url.params["rated"] == "true" and request.url.params["perfType"]
                 assert request.url.params["moves"] == "false" and "since" in request.url.params
                 if user not in self.games_by_user:
                     return httpx.Response(404, json={"error": "not found"})
@@ -198,6 +198,16 @@ async def test_seeds_fall_back_to_capped_arenas(tmp_path):
     assert sorted(db.active_player_ids()) == ["lowkey", "pal"]
     assert result.added == 2
     db.close()
+
+
+async def test_crawl_requests_the_perf_types_of_the_configured_clocks(tmp_path):
+    fake = FakeLichess({"seed": []}, {})
+    settings = Settings(pool=PoolSettings(rating_cap=1000, seed_players=["seed"]),
+                        detection=DetectionSettings(time_controls=["3+0", "10+0"]))
+    await run_crawl(tmp_path, fake, settings)
+    games_requests = [params for m, p, params, _ in fake.requests if p.startswith("/api/games/user/")]
+    assert games_requests and games_requests[0]["perfType"] == "blitz,rapid"
+    assert games_requests[0]["max"] == "75"
 
 
 async def test_crawl_without_any_seed_reports_it(tmp_path):

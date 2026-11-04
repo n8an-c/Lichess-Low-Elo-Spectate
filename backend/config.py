@@ -114,8 +114,10 @@ class DetectionSettings:
             if parse_time_control(tc) is None:
                 raise ValueError(f"[detection] time control {tc!r} is not minutes+increment, e.g. \"3+0\"")
         object.__setattr__(self, "time_controls", tcs)
-        if self.verify_concurrency < 1 or self.cold_batches_per_tick < 1:
-            raise ValueError("[detection] verify_concurrency and cold_batches_per_tick must be at least 1")
+        if not 1 <= self.verify_concurrency <= 8:
+            raise ValueError("[detection] verify_concurrency must be between 1 and 8 (Lichess allows 8 game streams per IP)")
+        if self.cold_batches_per_tick < 1:
+            raise ValueError("[detection] cold_batches_per_tick must be at least 1")
 
     @property
     def poll_enabled(self) -> bool:

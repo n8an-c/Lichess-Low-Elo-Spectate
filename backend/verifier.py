@@ -95,6 +95,7 @@ class Verdict:
     accepted: bool
     reason: str
     game: GameInfo | None = None
+    transient: bool = False  # a later retry may succeed (timeout, network error, rate limit)
 
 
 def _player(side: dict) -> PlayerInfo | None:
@@ -263,10 +264,14 @@ async def read_replay(reader: StreamReader, det, *, max_plies: int | None = None
     last: dict | None = None
     first_clock_checked = False
     allowed_initials = det.initial_seconds()
+    waiting_for_first = True
     while True:
-        line = await reader.next(det.replay_idle_seconds)
+        # The first position line can take a moment to arrive after the header
+        # (network, load); only the gaps *between* replayed lines are short.
+        line = await reader.next(det.stream_open_timeout_seconds if waiting_for_first else det.replay_idle_seconds)
         if line is None:
             return last  # replay burst finished; the game is live from here
+        waiting_for_first = False
         if is_game_description(line):
             raise StreamEnded(line, last)
         if "fen" not in line:
@@ -324,11 +329,11 @@ async def verify_game(
     except StreamEnded:
         return Verdict(False, "empty stream")
     except asyncio.TimeoutError:
-        return Verdict(False, "stream open timed out")
+        return Verdict(False, "stream open timed out", transient=True)
     except LichessHTTPError as exc:
         return Verdict(False, f"HTTP {exc.status_code}")
-    except LichessError as exc:
-        return Verdict(False, str(exc))
+    except LichessError as exc:  # transport error or rate limit: worth another try later
+        return Verdict(False, str(exc), transient=True)
     try:
         if discover is not None and is_rated_standard(head, det.speeds()):
             for p in header_players(head):
@@ -352,9 +357,9 @@ async def verify_game(
         except ValueError as exc:
             return Verdict(False, str(exc))
         except LichessError as exc:
-            return Verdict(False, str(exc))
+            return Verdict(False, str(exc), transient=True)
         if last is None:
-            return Verdict(False, "no position received")
+            return Verdict(False, "no position received", transient=True)
         plies = plies_from_fen(last["fen"])
         age = (now - game.created_at) / 1000 if game.created_at else None
         if plies > 0 and age is not None and age > det.max_game_age_seconds:

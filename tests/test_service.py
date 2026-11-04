@@ -66,6 +66,33 @@ async def test_teams_only_source_has_no_trickle_loop(tmp_path):
     spectator.db.close()
 
 
+async def test_transient_verification_failures_are_not_recorded(tmp_path):
+    settings = make_settings(tmp_path, "poll")
+
+    def handler(request):
+        if request.url.path.startswith("/api/stream/game/"):
+            raise httpx.ConnectError("boom", request=request)
+        return httpx.Response(200, json=[])
+
+    client = LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=httpx.MockTransport(handler))
+    spectator = Spectator(settings, skip_pool_build=True, client=client)
+    task = asyncio.create_task(spectator.verifier_loop())
+    spectator.pending.add("flaky001")
+    await spectator.queue.put("flaky001")
+    await asyncio.wait_for(spectator.queue.join(), 3)
+    task.cancel()
+    assert not spectator.db.game_seen("flaky001")  # can be queued again when seen next
+    assert spectator.rejected_total == 0 and not spectator.pending
+    await client.aclose()
+    spectator.db.close()
+
+
+def test_verify_concurrency_is_capped_at_lichess_stream_limit():
+    with pytest.raises(ValueError):
+        DetectionSettings(verify_concurrency=9)
+    assert DetectionSettings(verify_concurrency=8).verify_concurrency == 8
+
+
 async def test_verifications_run_concurrently(tmp_path):
     import json
 

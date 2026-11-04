@@ -31,6 +31,26 @@ NDJSON = "application/x-ndjson"
 STREAM_READ_TIMEOUT = 900.0  # seconds without a byte before an NDJSON stream is considered dead
 
 
+def retry_after_seconds(value: str | None) -> float:
+    """Seconds from a Retry-After header (delay-seconds or an HTTP date); 0 if absent or unreadable."""
+    if not value:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+
+
 class LichessError(Exception):
     """Base class for client errors."""
 
@@ -95,12 +115,7 @@ class LichessClient:
 
     def _enter_pause(self, retry_after: str | None = None) -> None:
         self.rate_limit_hits += 1
-        seconds = self.settings.rate_limit_pause_seconds
-        if retry_after:
-            try:
-                seconds = max(seconds, float(retry_after))
-            except ValueError:
-                pass
+        seconds = max(self.settings.rate_limit_pause_seconds, retry_after_seconds(retry_after))
         self._pause_until = time.monotonic() + seconds
         log.warning("Lichess returned 429; pausing all requests for %.0fs", seconds)
 

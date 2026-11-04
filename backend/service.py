@@ -49,6 +49,7 @@ class Spectator:
         self.restart_delay = 5.0
         self.started_at = time.time()
         self.building = False
+        self._pool_lock = asyncio.Lock()  # build / top-up, trickle and refresh never run at the same time
         self._pool_size_cache: tuple[float, int] = (0.0, 0)
         self._tasks: list[asyncio.Task] = []
         self._verify_tasks: set[asyncio.Task] = set()
@@ -132,6 +133,10 @@ class Spectator:
 
     async def build_or_top_up(self) -> None:
         """Teams scan (if enabled and stale) and/or snowball crawl up to the member target."""
+        async with self._pool_lock:
+            await self._build_or_top_up()
+
+    async def _build_or_top_up(self) -> None:
         pool = self.settings.pool
         self.building = True
         try:
@@ -176,65 +181,78 @@ class Spectator:
         pool = self.settings.pool
         while True:
             await asyncio.sleep(pool.trickle_interval_minutes * 60)
-            if self.crawler is None or self.building:
-                continue
+            if self.crawler is None or self._pool_lock.locked():
+                continue  # a build or refresh is running; try again next time
             try:
-                if self.db.active_count() >= pool.max_members * 1.25:
-                    continue  # expiry will trim the pool first
-                parents = self.db.most_active_members(pool.trickle_players)
-                if self.poller is not None:
-                    for pid in sorted(self.poller.hot, key=self.poller.hot.get, reverse=True):
-                        if len(parents) >= pool.trickle_players * 2:
-                            break
-                        if pid not in parents:
-                            parents.append(pid)
-                if not parents:
-                    continue
-                now = now_ms()
-                result = await self.crawler.crawl(
-                    request_budget=len(parents),
-                    since_ms=int(now - pool.trickle_hours * 3_600_000),
-                    parents=parents,
-                    expand=False,
-                    now_ms=now,
-                )
-                if result.added:
-                    log.info("trickle: %d new members from %d players' latest games", result.added, result.players_expanded)
-                    self.pool_refreshed.set()
+                async with self._pool_lock:
+                    await self._trickle_once()
             except Exception:
                 log.exception("trickle crawl failed")
+
+    async def _trickle_once(self) -> None:
+        pool = self.settings.pool
+        if self.db.active_count() >= pool.max_members * 1.25:
+            return  # expiry will trim the pool first
+        parents = self.db.most_active_members(pool.trickle_players)
+        if self.poller is not None:
+            for pid in sorted(self.poller.hot, key=self.poller.hot.get, reverse=True):
+                if len(parents) >= pool.trickle_players * 2:
+                    break
+                if pid not in parents:
+                    parents.append(pid)
+        if not parents:
+            return
+        now = now_ms()
+        result = await self.crawler.crawl(
+            request_budget=len(parents),
+            since_ms=int(now - pool.trickle_hours * 3_600_000),
+            parents=parents,
+            expand=False,
+            now_ms=now,
+        )
+        if result.added:
+            log.info("trickle: %d new members from %d players' latest games", result.added, result.players_expanded)
+            self.pool_refreshed.set()
 
     async def refresh_loop(self) -> None:
         """Light refresh: re-check stale profiles, look up discovered opponents, expire inactive members."""
         pool = self.settings.pool
         while True:
             await asyncio.sleep(pool.light_refresh_minutes * 60)
-            if self.building:
+            if self._pool_lock.locked():
                 continue
             try:
-                now = now_ms()
-                changed = False
-                budget = pool.max_profile_refresh_batches
-                stale = self.db.members_to_recheck(now - int(pool.profile_recheck_hours * 3_600_000), limit=budget * 300)
-                if stale:
-                    summary = await confirm_members(self.client, self.db, pool, stale, now_ms=now, max_batches=budget)
-                    budget -= summary.requests
-                    log.info("profile refresh: %d checked, %d kept, %d dropped", summary.checked, summary.kept, summary.dropped)
-                    changed = changed or summary.dropped > 0
-                if budget > 0:
-                    fetched, added, waiting = await fetch_discovered(self.client, self.db, pool, now, budget)
-                    if fetched:
-                        log.info("discovered opponents: %d looked up, %d added, %d waiting", fetched, added, waiting)
-                        changed = changed or added > 0
-                if pool.games_enabled:
-                    expired = self.db.expire_inactive_members(since_days_ms(now, pool.games_since_days), updated_at=now)
-                    if expired:
-                        log.info("expired %d members with no game in %d days", expired, pool.games_since_days)
-                        changed = True
-                if changed:
-                    self.pool_refreshed.set()
+                async with self._pool_lock:
+                    await self._refresh_once()
             except Exception:
                 log.exception("light refresh failed")
+
+    async def _refresh_once(self) -> None:
+        pool = self.settings.pool
+        now = now_ms()
+        changed = False
+        budget = pool.max_profile_refresh_batches
+        stale = self.db.members_to_recheck(now - int(pool.profile_recheck_hours * 3_600_000), limit=budget * 300)
+        if stale:
+            summary = await confirm_members(self.client, self.db, pool, stale, now_ms=now, max_batches=budget)
+            budget -= summary.requests
+            log.info("profile refresh: %d checked, %d kept, %d dropped", summary.checked, summary.kept, summary.dropped)
+            changed = changed or summary.dropped > 0
+            if summary.rate_limited:
+                log.warning("profile refresh was rate limited; skipping the rest of this refresh")
+                budget = 0
+        if budget > 0:
+            fetched, added, waiting = await fetch_discovered(self.client, self.db, pool, now, budget)
+            if fetched:
+                log.info("discovered opponents: %d looked up, %d added, %d waiting", fetched, added, waiting)
+                changed = changed or added > 0
+        if pool.games_enabled:
+            expired = self.db.expire_inactive_members(since_days_ms(now, pool.games_since_days), updated_at=now)
+            if expired:
+                log.info("expired %d members with no game in %d days", expired, pool.games_since_days)
+                changed = True
+        if changed:
+            self.pool_refreshed.set()
 
     # -- verification ------------------------------------------------------------------
 
@@ -250,6 +268,10 @@ class Spectator:
     async def _verify_one(self, game_id: str, sem: asyncio.Semaphore) -> None:
         try:
             verdict = await verify_game(self.client, game_id, self.settings, discover=self.discover)
+            if verdict.transient:
+                # Not recorded in seen_games: the poller re-queues it if it is still being played.
+                log.warning("could not verify %s (%s); will retry if it is seen again", game_id, verdict.reason)
+                return
             self.db.record_game(game_id, verdict.accepted)
             if verdict.accepted and verdict.game is not None:
                 self.record_accepted(verdict.game)

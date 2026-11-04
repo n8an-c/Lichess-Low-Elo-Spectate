@@ -96,6 +96,19 @@ async def test_user_games_params():
         assert captured["accept"] == "application/x-ndjson"
 
 
+def test_retry_after_header_parsing():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from backend.lichess import retry_after_seconds
+
+    assert retry_after_seconds(None) == 0.0
+    assert retry_after_seconds("12") == 12.0
+    assert retry_after_seconds("garbage") == 0.0
+    soon = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+    assert 25.0 <= retry_after_seconds(soon) <= 30.0
+
+
 async def test_429_honours_retry_after_when_longer():
     codes = iter([429, 200])
     times = []
