@@ -132,6 +132,43 @@ async def test_build_pool_end_to_end(tmp_path):
     db.close()
 
 
+async def test_discovered_opponents_are_fetched_with_the_remaining_budget(tmp_path):
+    profiles = {
+        "stale1": user(id="stale1", username="Stale1", perfs={"blitz": {"games": 50, "rating": 850, "rd": 60, "prog": 0}}),
+        "opp-good": user(id="opp-good", username="OppGood", perfs={"blitz": {"games": 40, "rating": 700, "rd": 60, "prog": 0}}),
+        "opp-prov": user(id="opp-prov", username="OppProv", perfs={"blitz": {"games": 3, "rating": 700, "rd": 300, "prog": 0, "prov": True}}),
+        "opp-strong": user(id="opp-strong", username="OppStrong", perfs={"blitz": {"games": 300, "rating": 1300, "rd": 45, "prog": 0}}),
+    }
+    transport, calls = fake_lichess({}, {}, profiles)
+    db = Database(tmp_path / "t.sqlite3")
+    from backend.db import PlayerRow
+
+    db.upsert_players([PlayerRow("stale1", "Stale1", 850, False, NOW)])
+    for pid, rating in [("opp-good", 720), ("opp-prov", 700), ("opp-strong", 990)]:
+        db.record_discovered(pid, rating)
+
+    # Budget of one batch: the stale pool refresh uses it, opponents wait.
+    settings = PoolSettings(max_profile_refresh_batches=1)
+    async with LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=transport) as client:
+        result = await build_pool(client, db, settings, now_ms=NOW)
+    assert result.refreshed == 1
+    assert result.discovered_fetched == 0 and result.discovered_pending == 3
+    assert sorted(db.discovered_to_fetch()) == ["opp-good", "opp-prov", "opp-strong"]
+
+    # Budget of two: the second batch looks up the opponents.
+    settings = PoolSettings(max_profile_refresh_batches=2)
+    async with LichessClient(LichessSettings(courtesy_delay_seconds=0), transport=transport) as client:
+        result = await build_pool(client, db, settings, now_ms=NOW)
+    assert result.discovered_fetched == 3 and result.discovered_added == 1 and result.discovered_pending == 0
+    assert sorted(db.active_player_ids()) == ["opp-good", "stale1"]
+    assert db.conn.execute("SELECT source_team FROM players WHERE id = 'opp-good'").fetchone()[0] == "opponent"
+    assert db.discovered_to_fetch() == []  # all marked fetched, qualifying or not
+    posts = [c.content.decode() for c in calls if c.method == "POST" and c.url.path == "/api/users"]
+    assert set(posts[-1].split(",")) == {"opp-strong", "opp-prov", "opp-good"}
+    assert "opponents: 3 fetched, 1 added, 0 waiting" in result.summary()
+    db.close()
+
+
 async def test_max_members_per_team_stops_stream_and_releases_lock(tmp_path):
     members = {"big": [user(id=f"u{i}", username=f"U{i}") for i in range(50)]}
     transport, calls = fake_lichess(members)

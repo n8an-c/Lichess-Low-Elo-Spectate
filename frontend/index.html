@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Low-ELO Lichess Spectator</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; display: flex; justify-content: center; }
+      main { width: min(92vw, 760px); padding: 1.25rem 0 3rem; }
+      h1 { font-size: 1.2rem; margin: 0 0 0.25rem; }
+      .stats { font-size: 0.85rem; opacity: 0.75; margin: 0 0 1rem; }
+      .stats.error { color: #d33; opacity: 1; }
+      ul { list-style: none; padding: 0; margin: 0; }
+      li { padding: 0.7rem 0.6rem; border-top: 1px solid rgba(127, 127, 127, 0.25); display: grid;
+           grid-template-columns: 1fr auto; gap: 0.25rem 1rem; align-items: center; }
+      li:first-child { border-top: 0; }
+      li.fresh { background: rgba(118, 150, 86, 0.12); }
+      li.stale { opacity: 0.55; }
+      .players { font-size: 1.05rem; }
+      .players .rating { opacity: 0.7; font-size: 0.9em; }
+      .meta { font-size: 0.8rem; opacity: 0.75; grid-column: 1; }
+      a.watch { font-weight: 600; text-decoration: none; padding: 0.35rem 0.8rem; border-radius: 6px;
+                border: 1px solid currentColor; grid-row: 1 / span 2; }
+      .empty { padding: 2rem 0; opacity: 0.7; }
+      code { font-size: 0.85em; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Low-ELO Lichess Spectator</h1>
+      <p class="stats" id="stats">Connecting…</p>
+      <ul id="games"></ul>
+      <p class="empty" id="empty" hidden>No qualifying games yet. Rated games with the configured time controls
+        between players under the rating cap appear here within seconds of starting; each link opens the live game
+        on lichess.org. If the pool is still being built, give it a few minutes.</p>
+    </main>
+    <script>
+      const REFRESH_MS = 4000;
+      const FRESH_SECONDS = 90;   // a game found this recently is still near the start
+      const STALE_SECONDS = 480;  // a 3+0 game is almost certainly over after 8 minutes
+      const gamesEl = document.getElementById("games");
+      const statsEl = document.getElementById("stats");
+      const emptyEl = document.getElementById("empty");
+
+      function ago(seconds) {
+        if (seconds < 60) return `${seconds}s ago`;
+        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+        return `${Math.floor(seconds / 3600)}h ago`;
+      }
+
+      function player(p) {
+        const name = p.title ? `${p.title} ${p.name}` : p.name;
+        return `${escapeHtml(name)} <span class="rating">(${p.rating})</span>`;
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      }
+
+      function render(data) {
+        const now = data.now;
+        gamesEl.innerHTML = "";
+        for (const g of data.games) {
+          const age = g.ageSeconds ?? Math.round(now - g.foundAt);
+          const li = document.createElement("li");
+          li.className = age < FRESH_SECONDS ? "fresh" : age > STALE_SECONDS ? "stale" : "";
+          const state = age > STALE_SECONDS ? "probably finished" : age < FRESH_SECONDS ? "just started" : "in progress";
+          const ply = g.estimatedPlies ?? g.pliesAtJoin;
+          li.innerHTML =
+            `<div class="players">${player(g.white)} vs ${player(g.black)}</div>` +
+            `<a class="watch" href="${g.url}" target="_blank" rel="noopener">Watch on Lichess ↗</a>` +
+            `<div class="meta">found ${ago(Math.round(now - g.foundAt))} at about ply ${ply} · started ${ago(age)} · ${state} · <code>${g.id}</code></div>`;
+          gamesEl.appendChild(li);
+        }
+        emptyEl.hidden = data.games.length > 0;
+        const s = data.stats;
+        const detectors = s.mode === "both" ? "polling + stream" : s.mode === "poll" ? "polling" : "stream";
+        const rule = `${(s.timeControls || []).join("/")} · ${s.ratingRule === "either" ? "one" : "both"} under ${s.ratingCap}`;
+        statsEl.className = "stats";
+        statsEl.textContent =
+          `${s.poolSize} players in the pool` +
+          (s.hotPlayers != null ? ` (${s.hotPlayers} online)` : "") +
+          (s.building ? " · building the pool…" : "") +
+          ` · ${rule} · ${detectors} · ${s.accepted} games found, ${s.rejected} rejected` +
+          (s.rateLimitHits ? ` · ${s.rateLimitHits} rate-limit pauses` : "") +
+          (s.discoveredPending ? ` · ${s.discoveredPending} opponents waiting for the next refresh` : "") +
+          ` · refreshes every ${REFRESH_MS / 1000}s`;
+      }
+
+      async function refresh() {
+        try {
+          const r = await fetch("/api/games?limit=50", { cache: "no-store" });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          render(await r.json());
+        } catch (e) {
+          statsEl.className = "stats error";
+          statsEl.textContent = `Cannot reach the backend (${e.message}); retrying…`;
+        }
+      }
+
+      refresh();
+      setInterval(refresh, REFRESH_MS);
+    </script>
+  </body>
+</html>

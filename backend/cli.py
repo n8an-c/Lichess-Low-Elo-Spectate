@@ -8,10 +8,14 @@ import logging
 import sys
 from datetime import datetime, timezone
 
+import dataclasses
+
 from .config import load_settings
-from .db import Database
+from .db import Database, now_ms
 from .lichess import LichessClient
 from .pool import build_pool
+from .service import Spectator
+from .snowball import Crawler, since_days_ms
 
 
 def _iso(ms: int | None) -> str:
@@ -22,11 +26,70 @@ def _iso(ms: int | None) -> str:
 
 async def cmd_build_pool(args: argparse.Namespace) -> int:
     settings = load_settings(args.config)
+    pool = settings.pool
+    overrides = {}
+    if args.source:
+        overrides["source"] = args.source
+    if args.max_members:
+        overrides["max_members"] = args.max_members
+    if args.budget:
+        overrides["crawl_request_budget"] = args.budget
+    if overrides:
+        pool = dataclasses.replace(pool, **overrides)
+        settings = dataclasses.replace(settings, pool=pool)
     async with LichessClient(settings.lichess) as client:
         with Database(settings.storage.sqlite_path) as db:
-            result = await build_pool(client, db, settings.pool, max_teams=args.max_teams)
-    print()
-    print(result.summary())
+            if pool.teams_enabled:
+                result = await build_pool(client, db, pool, max_teams=args.max_teams)
+                print()
+                print(result.summary())
+            if pool.games_enabled:
+                crawler = Crawler(client, db, settings)
+                now = now_ms()
+                print(f"\ncrawling rated {settings.detection.label} games (target {pool.max_members} members, "
+                      f"budget {pool.crawl_request_budget} requests)", file=sys.stderr)
+                result = await crawler.crawl(
+                    request_budget=pool.crawl_request_budget,
+                    since_ms=since_days_ms(now, pool.games_since_days),
+                    target_members=pool.max_members,
+                    now_ms=now,
+                )
+                print()
+                print(result.summary())
+            print(f"\nactive players in the pool: {db.active_count()}")
+    return 0
+
+
+async def cmd_watch(args: argparse.Namespace) -> int:
+    settings = load_settings(args.config)
+    spectator = Spectator(settings, skip_pool_build=args.skip_pool_build)
+    print("watching for games; press Ctrl+C to stop", file=sys.stderr)
+    try:
+        await spectator.run()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        passes = spectator.poller.passes if spectator.poller else 0
+        print(
+            f"accepted {spectator.accepted_total}, rejected {spectator.rejected_total}, poll passes {passes}",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from .main import FRONTEND_INDEX, create_app
+
+    settings = load_settings(args.config)
+    host = args.host or settings.server.host
+    port = args.port or settings.server.port
+    if not FRONTEND_INDEX.is_file():
+        print(f"note: {FRONTEND_INDEX} not found; only the JSON API will be served", file=sys.stderr)
+    app = create_app(settings, skip_pool_build=args.skip_pool_build)
+    print(f"serving on http://{host}:{port}/  (Ctrl+C to stop)", file=sys.stderr)
+    uvicorn.run(app, host=host, port=port, log_config=None)
     return 0
 
 
@@ -45,31 +108,65 @@ def cmd_show_pool(args: argparse.Namespace) -> int:
                 f"active blitz rating: min {stats['min_rating']}, avg {stats['avg_rating']}, "
                 f"max {stats['max_rating']}"
             )
+        sources = db.players_by_source()
+        if sources:
+            top = ", ".join(f"{src}: {n}" for src, n in list(sources.items())[:6])
+            print(f"active players by source: {top}{' …' if len(sources) > 6 else ''}")
+        disc = db.discovered_stats()
+        print(f"discovered opponents: {disc['total']} recorded, {disc['pending']} waiting for the next refresh")
+        act = db.activity_stats()
+        print(
+            f"activity: {act['with_games']} members with a known recent game, "
+            f"{act['last_day']} played in the last day, {act['last_week']} in the last week"
+        )
         rows = db.active_players(limit=args.limit)
         if rows:
             print()
-            print(f"{'id':<22} {'rating':>6} {'prov':>4}  {'seen (UTC)':<16} source team")
+            print(f"{'id':<22} {'rating':>6} {'prov':>4}  {'seen (UTC)':<16} {'last game (UTC)':<16} source")
             for r in rows:
                 print(
                     f"{r['id']:<22} {r['blitz_rating']:>6} {r['provisional']:>4}  "
-                    f"{_iso(r['seen_at']):<16} {r['source_team'] or '-'}"
+                    f"{_iso(r['seen_at']):<16} {_iso(r['last_game_at']):<16} {r['source_team'] or '-'}"
                 )
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m backend.cli", description="Low-ELO Lichess Spectator")
-    parser.add_argument("--config", default="config.toml", help="path to config.toml (default: ./config.toml)")
-    parser.add_argument("--log-level", default="INFO", help="DEBUG logs every Lichess request")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default="config.toml", help="path to config.toml (default: ./config.toml)")
+    common.add_argument("--log-level", default="INFO", help="DEBUG logs every Lichess request")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_build = sub.add_parser("build-pool", help="discover teams and write qualifying players to SQLite")
+    p_build = sub.add_parser(
+        "build-pool", parents=[common], help="build or top up the player pool (snowball crawl and/or team scan)"
+    )
+    p_build.add_argument("--source", choices=["games", "teams", "both"], default=None,
+                         help="override [pool].source for this run")
+    p_build.add_argument("--max-members", type=int, default=None, help="override [pool].max_members (crawl target)")
+    p_build.add_argument("--budget", type=int, default=None, help="override [pool].crawl_request_budget")
     p_build.add_argument(
-        "--max-teams", type=int, default=None, help="only scan the first N teams (quick trial run)"
+        "--max-teams", type=int, default=None, help="teams source: only scan the first N teams (quick trial run)"
     )
     p_build.set_defaults(func=lambda a: asyncio.run(cmd_build_pool(a)))
 
-    p_show = sub.add_parser("show-pool", help="print pool statistics and a sample of active players")
+    p_watch = sub.add_parser("watch", parents=[common], help="poll the pool, verify games and log qualifying ones (milestone 2)")
+    p_watch.add_argument(
+        "--skip-pool-build",
+        action="store_true",
+        help="do not (re)build the pool on startup even if it is stale; poll whatever is in the database",
+    )
+    p_watch.set_defaults(func=lambda a: asyncio.run(cmd_watch(a)))
+
+    p_serve = sub.add_parser("serve", parents=[common], help="run the detectors and the web page listing games found")
+    p_serve.add_argument("--host", default=None, help="bind address (default: [server].host in config)")
+    p_serve.add_argument("--port", type=int, default=None, help="port (default: [server].port in config)")
+    p_serve.add_argument(
+        "--skip-pool-build", action="store_true", help="do not (re)build the pool on startup even if it is stale"
+    )
+    p_serve.set_defaults(func=cmd_serve)
+
+    p_show = sub.add_parser("show-pool", parents=[common], help="print pool statistics and a sample of active players")
     p_show.add_argument("--limit", type=int, default=20, help="number of players to list (default 20)")
     p_show.set_defaults(func=cmd_show_pool)
 
@@ -79,7 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    for noisy in ("httpx", "httpcore", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
         return args.func(args)
     except KeyboardInterrupt:
