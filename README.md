@@ -1,4 +1,4 @@
-# Low-ELO Lichess Spectator
+# Low-Elo Lichess Spectator
 
 A local web app that finds rated 3+0 blitz games on Lichess where both players
 are rated under 1000 and lists them, as they start, with links to watch them
